@@ -39,3 +39,8 @@ tmp
 *.png
 *.wav
 *.webp
+
+# Large files / data / generations
+models/
+outputs/
+packages/ltx-trainer/data/cakeify-dataset/

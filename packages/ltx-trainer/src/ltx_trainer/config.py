@@ -458,12 +458,116 @@ class FlowMatchingConfig(ConfigBaseModel):
     )
 
 
+class RLConfig(ConfigBaseModel):
+    """Configuration for RL (DiffusionNFT) training"""
+
+    prompts_file: str | Path = Field(
+        description="Text file with one prompt per line",
+    )
+
+    num_samples_per_prompt: int = Field(
+        default=8,
+        description="Number of samples K per prompt (should equal or be divisible by num_gpus)",
+        gt=0,
+    )
+
+    generation_steps: int = Field(
+        default=20,
+        description="Number of denoising steps for generation",
+        gt=0,
+    )
+
+    generation_num_frames: int = Field(
+        default=9,
+        description="Number of frames to generate (must satisfy frames %% 8 == 1)",
+    )
+
+    generation_height: int = Field(
+        default=256,
+        description="Height of generated videos (must be divisible by 32)",
+    )
+
+    generation_width: int = Field(
+        default=256,
+        description="Width of generated videos (must be divisible by 32)",
+    )
+
+    reward_type: str = Field(
+        default="redness",
+        description="Type of reward function to use",
+    )
+
+    nft_beta: float = Field(
+        default=0.0001,
+        description="Beta for NFT positive/negative interpolation",
+        gt=0,
+    )
+
+    kl_beta: float = Field(
+        default=0.0001,
+        description="KL regularization weight",
+        ge=0,
+    )
+
+    adv_clip_max: float = Field(
+        default=5.0,
+        description="Advantage clipping range",
+        gt=0,
+    )
+
+    decay_rate: float = Field(
+        default=0.001,
+        description="Old adapter decay rate per step",
+        gt=0,
+    )
+
+    max_decay: float = Field(
+        default=0.5,
+        description="Maximum decay value",
+        gt=0,
+        le=1.0,
+    )
+
+    frame_rate: float = Field(
+        default=25.0,
+        description="Frame rate for generated videos",
+        gt=0,
+    )
+
+    video_save_interval: int | None = Field(
+        default=20,
+        description="Save comparison videos (old/new/ref/generated) every N iterations. None to disable.",
+    )
+
+    @field_validator("generation_num_frames")
+    @classmethod
+    def validate_gen_frames(cls, v: int) -> int:
+        if v % 8 != 1:
+            raise ValueError(f"generation_num_frames ({v}) must satisfy frames % 8 == 1")
+        return v
+
+    @field_validator("generation_height", "generation_width")
+    @classmethod
+    def validate_gen_dims(cls, v: int) -> int:
+        if v % 32 != 0:
+            raise ValueError(f"Dimension ({v}) must be divisible by 32")
+        return v
+
+    @field_validator("prompts_file")
+    @classmethod
+    def validate_prompts_file(cls, v: str | Path) -> str | Path:
+        if not Path(v).exists():
+            raise ValueError(f"Prompts file does not exist: {v}")
+        return v
+
+
 class LtxTrainerConfig(ConfigBaseModel):
     """Unified configuration for LTXV training"""
 
     # Sub-configurations
     model: ModelConfig = Field(default_factory=ModelConfig)
     lora: LoraConfig | None = Field(default=None)
+    rl: RLConfig | None = Field(default=None, description="RL (DiffusionNFT) training configuration")
     training_strategy: TrainingStrategyConfig = Field(
         default_factory=TextToVideoConfig,
         description="Training strategy configuration. Determines the training mode and its parameters.",

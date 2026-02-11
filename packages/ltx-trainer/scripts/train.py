@@ -12,14 +12,20 @@ For multi-GPU/FSDP training, configure and launch via Accelerate:
     accelerate launch scripts/train.py CONFIG_PATH
 """
 
+import os
 from pathlib import Path
 
+import torch
 import typer
 import yaml
 from rich.console import Console
 
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.trainer import LtxvTrainer
+
+# Set CUDA device early so model loading (before Accelerator init) uses the correct GPU.
+# Without this, all DDP processes load onto cuda:0 and OOM with many processes.
+torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
 
 console = Console()
 app = typer.Typer(
