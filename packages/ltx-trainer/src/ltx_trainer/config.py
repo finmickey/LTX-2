@@ -122,6 +122,23 @@ class OptimizationConfig(ConfigBaseModel):
         description="Maximum gradient norm for clipping",
     )
 
+    adam_weight_decay: float = Field(
+        default=1e-4,
+        description="AdamW weight decay (reference DiffusionNFT uses 1e-4)",
+        ge=0,
+    )
+
+    adam_betas: tuple[float, float] = Field(
+        default=(0.9, 0.999),
+        description="AdamW beta coefficients",
+    )
+
+    adam_epsilon: float = Field(
+        default=1e-8,
+        description="AdamW epsilon for numerical stability",
+        gt=0,
+    )
+
     optimizer_type: Literal["adamw", "adamw8bit"] = Field(
         default="adamw",
         description="Type of optimizer to use for training",
@@ -458,6 +475,13 @@ class FlowMatchingConfig(ConfigBaseModel):
     )
 
 
+class RewardConfig(ConfigBaseModel):
+    """Configuration for a single reward function."""
+
+    type: str = Field(description="Reward function name")
+    weight: float = Field(default=1.0, description="Weight for this reward in the combined sum", gt=0)
+
+
 class RLConfig(ConfigBaseModel):
     """Configuration for RL (DiffusionNFT) training"""
 
@@ -477,6 +501,15 @@ class RLConfig(ConfigBaseModel):
         gt=0,
     )
 
+    num_train_timesteps: int = Field(
+        default=1,
+        description="Number of timesteps to train on per generated sample. "
+        "Values > 1 enable multi-timestep training using the generation sigma schedule, "
+        "extracting more gradient signal per expensive generation. "
+        "Reference DiffusionNFT uses num_steps * timestep_fraction (~10-20).",
+        ge=1,
+    )
+
     generation_num_frames: int = Field(
         default=9,
         description="Number of frames to generate (must satisfy frames %% 8 == 1)",
@@ -492,15 +525,16 @@ class RLConfig(ConfigBaseModel):
         description="Width of generated videos (must be divisible by 32)",
     )
 
-    reward_type: str = Field(
-        default="redness",
-        description="Type of reward function to use",
+    rewards: list[RewardConfig] = Field(
+        default=[RewardConfig(type="redness", weight=1.0)],
+        description="List of reward functions with weights. Combined reward is a weighted sum.",
     )
 
     nft_beta: float = Field(
-        default=0.0001,
-        description="Beta for NFT positive/negative interpolation",
+        default=1.0,
+        description="NFT interpolation weight. Controls positive/negative prediction mix and policy loss scaling. Original paper uses 1.0 (default) or 0.1.",
         gt=0,
+        le=1.0,
     )
 
     kl_beta: float = Field(
@@ -535,8 +569,13 @@ class RLConfig(ConfigBaseModel):
     )
 
     video_save_interval: int | None = Field(
-        default=20,
-        description="Save comparison videos (old/new/ref/generated) every N iterations. None to disable.",
+        default=2,
+        description="Save comparison videos (old/new/ref/generated) every N optimizer steps. None to disable.",
+    )
+
+    checkpoint_save_interval: int | None = Field(
+        default=5,
+        description="Save LoRA checkpoint every N optimizer steps. None to disable.",
     )
 
     @field_validator("generation_num_frames")

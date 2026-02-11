@@ -6,6 +6,7 @@ Implements the NFT loss formulation for RL-based diffusion training:
 - KL regularization prevents the model from drifting too far from the base model
 """
 
+import torch
 from torch import Tensor
 
 
@@ -47,10 +48,13 @@ def compute_nft_loss(
     x0_pos = xt - t * positive_pred
     x0_neg = xt - t * negative_pred
 
-    # Adaptive weighting: mean absolute error per token
-    # [B, seq_len, 1]
-    weight_pos = (x0_pos - x0).abs().mean(dim=-1, keepdim=True).clip(min=1e-5)
-    weight_neg = (x0_neg - x0).abs().mean(dim=-1, keepdim=True).clip(min=1e-5)
+    # Adaptive weighting: per-sample weight computed in float64 with stop-gradient.
+    # Reference: NVlabs/DiffusionNFT uses torch.no_grad() + .double() for stability.
+    # Reduces over all dims except batch → one weight per sample [B, 1, 1].
+    reduce_dims = tuple(range(1, x0_pos.ndim))
+    with torch.no_grad():
+        weight_pos = (x0_pos.double() - x0.double()).abs().mean(dim=reduce_dims, keepdim=True).clip(min=1e-5).to(x0_pos.dtype)
+        weight_neg = (x0_neg.double() - x0.double()).abs().mean(dim=reduce_dims, keepdim=True).clip(min=1e-5).to(x0_neg.dtype)
 
     # Weighted MSE loss per sample: [B]
     pos_loss = ((x0_pos - x0) ** 2 / weight_pos).mean(dim=(-1, -2))
