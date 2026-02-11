@@ -127,6 +127,46 @@ class RedOrBlueReward(RewardFunction):
         return per_frame.mean().item()
 
 
+class FrameContrastReward(RewardFunction):
+    """Mean L1 color distance between consecutive frames.
+
+    Measures how much color changes from one frame to the next.
+    All-same-color scores 0, alternating red/blue scores ~2.0.
+    """
+
+    def compute(self, video: Tensor) -> float:
+        # video: [C, F, H, W] — mean color per frame: [C, F]
+        frame_colors = video.mean(dim=(2, 3))
+        if frame_colors.shape[1] < 2:
+            return 0.0
+        diffs = (frame_colors[:, 1:] - frame_colors[:, :-1]).abs().sum(dim=0)  # [F-1]
+        return diffs.mean().item()
+
+
+class ColorAlternationReward(RewardFunction):
+    """Rewards having both red and blue frames in the video.
+
+    Pure min(mean_red, mean_blue) — always points gradient toward the
+    MINORITY color. No bootstrap needed: the per-prompt std normalization
+    in the NFT advantage computation amplifies even tiny differences
+    (variance 0.001 becomes advantage ±1 after division by std).
+
+    All-red scores 0, alternating R/B scores 0.5. Use high weight (50)
+    to ensure the min variance dominates the total reward variance.
+
+    Scores: black=0, all-red=0, all-blue=0, alternating R/B=0.50
+    """
+
+    def compute(self, video: Tensor) -> float:
+        r, g, b = video[0], video[1], video[2]  # [F, H, W]
+        redness = (r - torch.max(g, b)).mean(dim=(1, 2))  # [F]
+        blueness = (b - torch.max(r, g)).mean(dim=(1, 2))  # [F]
+
+        mean_red = redness.clamp(min=0).mean()  # avg positive redness across frames
+        mean_blue = blueness.clamp(min=0).mean()  # avg positive blueness across frames
+
+        return torch.min(mean_red, mean_blue).item()
+
 class ChangingColorsReward(RewardFunction):
     """Reward that measures how much each frame's color differs from recent frames.
 
@@ -208,6 +248,8 @@ def get_reward_function(name: str) -> RewardFunction:
         "uniform_frame": UniformFrameReward,
         "changing_colors": ChangingColorsReward,
         "red_or_blue": RedOrBlueReward,
+        "frame_contrast": FrameContrastReward,
+        "color_alternation": ColorAlternationReward,
     }
 
     if name not in reward_functions:

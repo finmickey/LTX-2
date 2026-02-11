@@ -1,0 +1,3 @@
+[submodule "DiffusionNFT"]
+	path = DiffusionNFT
+	url = https://github.com/NVlabs/DiffusionNFT.git

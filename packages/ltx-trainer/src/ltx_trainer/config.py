@@ -479,7 +479,6 @@ class RewardConfig(ConfigBaseModel):
     """Configuration for a single reward function."""
 
     type: str = Field(description="Reward function name")
-    weight: float = Field(default=1.0, description="Weight for this reward in the combined sum", gt=0)
 
 
 class RLConfig(ConfigBaseModel):
@@ -501,15 +500,6 @@ class RLConfig(ConfigBaseModel):
         gt=0,
     )
 
-    num_train_timesteps: int = Field(
-        default=1,
-        description="Number of timesteps to train on per generated sample. "
-        "Values > 1 enable multi-timestep training using the generation sigma schedule, "
-        "extracting more gradient signal per expensive generation. "
-        "Reference DiffusionNFT uses num_steps * timestep_fraction (~10-20).",
-        ge=1,
-    )
-
     generation_num_frames: int = Field(
         default=9,
         description="Number of frames to generate (must satisfy frames %% 8 == 1)",
@@ -526,8 +516,8 @@ class RLConfig(ConfigBaseModel):
     )
 
     rewards: list[RewardConfig] = Field(
-        default=[RewardConfig(type="redness", weight=1.0)],
-        description="List of reward functions with weights. Combined reward is a weighted sum.",
+        default=[RewardConfig(type="redness")],
+        description="List of reward functions. Combined reward is a simple sum.",
     )
 
     nft_beta: float = Field(
@@ -543,10 +533,11 @@ class RLConfig(ConfigBaseModel):
         ge=0,
     )
 
-    adv_clip_max: float = Field(
-        default=5.0,
-        description="Advantage clipping range",
-        gt=0,
+    old_update_interval: int = Field(
+        default=1,
+        description="Number of optimizer steps between old←new adapter updates. "
+        "Set > 1 to decouple old adapter update frequency from optimizer steps.",
+        ge=1,
     )
 
     decay_rate: float = Field(

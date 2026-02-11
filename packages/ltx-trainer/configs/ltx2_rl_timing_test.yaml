@@ -1,0 +1,64 @@
+# Timing test: 5 optimizer steps, same settings as redness config
+model:
+  model_path: "models/ltx-2-19b-dev.safetensors"
+  text_encoder_path: "models/gemma-3-12b-it-qat-q4_0-unquantized"
+  training_mode: "lora"
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+rl:
+  prompts_file: "packages/ltx-trainer/data/rl_prompts_50.txt"
+  num_samples_per_prompt: 16
+  generation_steps: 20
+  generation_num_frames: 9
+  generation_height: 256
+  generation_width: 256
+  frame_rate: 25.0
+  rewards:
+    - type: "redness"
+  nft_beta: 1.0
+  kl_beta: 0.0001
+  old_update_interval: 8
+  decay_rate: 0.001
+  max_decay: 0.5
+  video_save_interval: null  # disable video saving to focus on timing
+
+training_strategy:
+  name: "text_to_video"
+  first_frame_conditioning_p: 0.0
+  with_audio: false
+
+data:
+  preprocessed_data_root: "/tmp/unused"
+
+optimization:
+  learning_rate: 3e-4
+  steps: 5
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "constant"
+  enable_gradient_checkpointing: false
+
+acceleration:
+  mixed_precision_mode: "bf16"
+
+checkpoints:
+  interval: null
+  keep_last_n: -1
+  precision: "bfloat16"
+
+wandb:
+  enabled: false
+
+seed: 42
+output_dir: "outputs/rl_timing_test"

@@ -1,0 +1,95 @@
+# =============================================================================
+# LTX-2 RL Training Configuration (DiffusionNFT)
+# =============================================================================
+#
+# This configuration trains LoRA adapters using reinforcement learning.
+# Instead of ground-truth data, the model generates videos, scores them with
+# a reward function, and updates weights to produce higher-reward outputs.
+#
+# Usage:
+#   accelerate launch --num_processes=8 scripts/rl_train.py configs/ltx2_rl_nft.yaml
+#
+# =============================================================================
+
+# Model configuration
+model:
+  model_path: "path/to/ltx-2-model.safetensors"
+  text_encoder_path: "path/to/gemma-text-encoder"
+  training_mode: "lora"
+
+# LoRA configuration
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+# RL (DiffusionNFT) configuration
+rl:
+  # Text file with one prompt per line
+  prompts_file: "path/to/prompts.txt"
+
+  # K samples per prompt (should match num_processes for 1 sample per GPU)
+  num_samples_per_prompt: 8
+
+  # Generation parameters
+  generation_steps: 20
+  generation_num_frames: 9
+  generation_height: 256
+  generation_width: 256
+  frame_rate: 25.0
+
+  # Reward functions (combined reward is a simple sum)
+  rewards:
+    - type: "redness"
+
+  # NFT algorithm parameters
+  nft_beta: 1.0           # Interpolation weight for positive/negative predictions
+  kl_beta: 0.0001        # KL regularization weight
+  decay_rate: 0.001      # Old adapter decay rate per step
+  max_decay: 0.5         # Maximum decay value
+
+# Training strategy (required by config but not used by RL trainer)
+training_strategy:
+  name: "text_to_video"
+  first_frame_conditioning_p: 0.0
+  with_audio: false
+
+# Data config (required by config but not used by RL trainer)
+data:
+  preprocessed_data_root: "/tmp/unused"
+
+# Optimization
+optimization:
+  learning_rate: 3e-4
+  steps: 100
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "constant"
+  enable_gradient_checkpointing: false
+
+# Acceleration
+acceleration:
+  mixed_precision_mode: "bf16"
+
+# Checkpoints
+checkpoints:
+  interval: 25
+  keep_last_n: -1
+  precision: "bfloat16"
+
+# W&B (optional)
+wandb:
+  enabled: false
+  project: "ltx2-rl-nft"
+  tags: ["ltx2", "rl", "nft"]
+
+# General
+seed: 42
+output_dir: "outputs/rl_nft"

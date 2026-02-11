@@ -1,0 +1,79 @@
+# =============================================================================
+# LTX-2 RL Color Cycling Training — Run 5i (pure min, high weight)
+# =============================================================================
+#
+# Pure min(mean_red, mean_blue) at weight 50. No bootstrap, no uniform_frame.
+# The per-prompt std normalization amplifies tiny min differences into
+# meaningful advantages (variance 0.001 → advantage ±1).
+#
+# All-red scores 0 (no attractor), alternating R/B scores 25.0.
+#
+# Usage:
+#   accelerate launch --num_processes=8 scripts/rl_train.py configs/ltx2_rl_color_cycle.yaml
+#
+# =============================================================================
+
+model:
+  model_path: "models/ltx-2-19b-dev.safetensors"
+  text_encoder_path: "models/gemma-3-12b-it-qat-q4_0-unquantized"
+  training_mode: "lora"
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+rl:
+  prompts_file: "packages/ltx-trainer/data/rl_prompts_50.txt"
+  num_samples_per_prompt: 16
+  generation_steps: 20
+  generation_num_frames: 81
+  generation_height: 256
+  generation_width: 256
+  frame_rate: 25.0
+  rewards:
+    - type: "color_alternation"
+  nft_beta: 1.0
+  kl_beta: 0.0001
+  old_update_interval: 8
+  decay_rate: 0.01
+  max_decay: 0.5
+  video_save_interval: 2
+
+# Required by config but not used by RL trainer
+training_strategy:
+  name: "text_to_video"
+  first_frame_conditioning_p: 0.0
+  with_audio: false
+
+data:
+  preprocessed_data_root: "/tmp/unused"
+
+optimization:
+  learning_rate: 3e-4
+  steps: 25
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "constant"
+  enable_gradient_checkpointing: false
+
+acceleration:
+  mixed_precision_mode: "bf16"
+
+checkpoints:
+  interval: 10
+  keep_last_n: -1
+  precision: "bfloat16"
+
+wandb:
+  enabled: false
+
+seed: 42
+output_dir: "outputs/rl_color_cycle_run5i"
