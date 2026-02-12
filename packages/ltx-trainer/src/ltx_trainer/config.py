@@ -488,8 +488,14 @@ class RLConfig(ConfigBaseModel):
         description="Text file with one prompt per line",
     )
 
+    validation_prompts_file: str | Path | None = Field(
+        default=None,
+        description="Text file with validation prompts (format: 'nickname | Full prompt text'). "
+        "Must have exactly num_gpus lines. Each GPU generates its assigned prompt using the old adapter.",
+    )
+
     num_samples_per_prompt: int = Field(
-        default=8,
+        default=16,
         description="Number of samples K per prompt (should equal or be divisible by num_gpus)",
         gt=0,
     )
@@ -528,9 +534,16 @@ class RLConfig(ConfigBaseModel):
     )
 
     kl_beta: float = Field(
-        default=0.0001,
+        default=0.1,
         description="KL regularization weight",
         ge=0,
+    )
+
+    num_timesteps_per_sample: int = Field(
+        default=1,
+        description="Number of random timesteps per sample per optimizer step. "
+        "Higher values give richer gradients at the cost of more forward passes.",
+        ge=1,
     )
 
     old_update_interval: int = Field(
@@ -569,6 +582,25 @@ class RLConfig(ConfigBaseModel):
         description="Save LoRA checkpoint every N optimizer steps. None to disable.",
     )
 
+    validation_grid_interval: int | None = Field(
+        default=None,
+        description="Generate a validation grid video every N optimizer steps. None to disable.",
+    )
+
+    precomputed_embeddings_dir: str | Path | None = Field(
+        default=None,
+        description="Directory with pre-computed prompt embeddings (.pt files). "
+        "When set, embeddings are loaded lazily instead of encoded at startup. "
+        "Generate with scripts/precompute_rl_embeddings.py.",
+    )
+
+    @field_validator("precomputed_embeddings_dir")
+    @classmethod
+    def validate_embeddings_dir(cls, v: str | Path | None) -> str | Path | None:
+        if v is not None and not Path(v).is_dir():
+            raise ValueError(f"precomputed_embeddings_dir does not exist: {v}")
+        return v
+
     @field_validator("generation_num_frames")
     @classmethod
     def validate_gen_frames(cls, v: int) -> int:
@@ -588,6 +620,13 @@ class RLConfig(ConfigBaseModel):
     def validate_prompts_file(cls, v: str | Path) -> str | Path:
         if not Path(v).exists():
             raise ValueError(f"Prompts file does not exist: {v}")
+        return v
+
+    @field_validator("validation_prompts_file")
+    @classmethod
+    def validate_validation_prompts_file(cls, v: str | Path | None) -> str | Path | None:
+        if v is not None and not Path(v).exists():
+            raise ValueError(f"Validation prompts file does not exist: {v}")
         return v
 
 

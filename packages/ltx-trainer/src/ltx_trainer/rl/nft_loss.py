@@ -20,7 +20,7 @@ def compute_nft_loss(
     r: Tensor,
     beta: float,
     kl_beta: float,
-) -> tuple[Tensor, dict[str, float]]:
+) -> tuple[Tensor, dict[str, Tensor]]:
     """Compute the DiffusionNFT loss.
 
     Args:
@@ -35,7 +35,7 @@ def compute_nft_loss(
         kl_beta: KL regularization weight.
 
     Returns:
-        Tuple of (total_loss, metrics_dict).
+        Tuple of (total_loss, metrics_dict with detached tensors).
     """
     # Positive and negative predictions via NFT interpolation
     positive_pred = beta * forward_pred + (1 - beta) * old_pred
@@ -70,11 +70,11 @@ def compute_nft_loss(
     total_loss = policy_loss.mean() + kl_beta * kl_loss
 
     metrics = {
-        "policy_loss": policy_loss.mean().item(),
-        "kl_loss": kl_loss.item(),
-        "pos_loss": pos_loss.mean().item(),
-        "neg_loss": neg_loss.mean().item(),
-        "total_loss": total_loss.item(),
+        "policy_loss": policy_loss.mean().detach(),
+        "kl_loss": kl_loss.detach(),
+        "pos_loss": pos_loss.mean().detach(),
+        "neg_loss": neg_loss.mean().detach(),
+        "total_loss": total_loss.detach(),
     }
 
     return total_loss, metrics

@@ -10,7 +10,10 @@ Each GPU trains on its own generated samples.
 
 import logging
 import os
+import subprocess
+import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -35,12 +38,19 @@ from ltx_trainer.model_loader import load_text_encoder
 from ltx_trainer.validation_sampler import CachedPromptEmbeddings
 from ltx_trainer.video_utils import save_video
 
+from .embedding_store import LazyEmbeddingStore
 from .generation import generate_video_latent
 from .nft_loss import compute_nft_loss
-from .rewards import get_reward_function
+from .rewards import get_reward_functions
 
 IS_MAIN_PROCESS = os.environ.get("LOCAL_RANK", "0") == "0"
 VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
+
+
+@dataclass
+class _ValidationPrompt:
+    nickname: str
+    embeddings: CachedPromptEmbeddings
 
 
 class RLTrainer:
@@ -55,7 +65,7 @@ class RLTrainer:
         self._rl_config = config.rl
 
         # Load text encoder, cache prompt embeddings, then unload heavy parts
-        self._cached_prompt_embeddings = self._load_text_encoder_and_cache_embeddings()
+        self._cached_prompt_embeddings, self._validation_prompts = self._load_text_encoder_and_cache_embeddings()
 
         # Load models
         self._load_models()
@@ -70,10 +80,10 @@ class RLTrainer:
         self._prepare_for_training()
 
         # Setup reward functions: list of (RewardFunction, name) tuples
-        self._reward_fns = [
-            (get_reward_function(rc.type), rc.type)
-            for rc in self._rl_config.rewards
-        ]
+        # video_score expands into one reward per dimension
+        self._reward_fns = []
+        for rc in self._rl_config.rewards:
+            self._reward_fns.extend(get_reward_functions(rc.type))
 
         # Patchifier for unpatchify during decode
         self._video_patchifier = VideoLatentPatchifier(patch_size=1)
@@ -94,6 +104,13 @@ class RLTrainer:
         num_processes = self._accelerator.num_processes
 
         set_seed(cfg.seed + rank)
+
+        # Validate that validation prompts count matches GPU count
+        if self._validation_prompts:
+            assert len(self._validation_prompts) == num_processes, (
+                f"Number of validation prompts ({len(self._validation_prompts)}) must equal "
+                f"num_processes ({num_processes})"
+            )
 
         # Compute samples per GPU and validate
         samples_per_gpu = rl_cfg.num_samples_per_prompt // num_processes
@@ -118,15 +135,21 @@ class RLTrainer:
         num_prompts = len(self._cached_prompt_embeddings)
         num_steps = cfg.optimization.steps
 
+        assert rl_cfg.num_timesteps_per_sample <= rl_cfg.generation_steps, (
+            f"num_timesteps_per_sample ({rl_cfg.num_timesteps_per_sample}) must be "
+            f"<= generation_steps ({rl_cfg.generation_steps})"
+        )
+
         logger.info(
             f"Starting RL training: {num_steps} optimizer steps, "
             f"{num_prompts} prompts, K={rl_cfg.num_samples_per_prompt} "
-            f"({samples_per_gpu} per GPU)"
+            f"({samples_per_gpu} per GPU), "
+            f"T={rl_cfg.num_timesteps_per_sample} timesteps/sample"
         )
 
-        # Save comparison videos at step 0 (before any training)
-        if rl_cfg.video_save_interval is not None:
-            self._save_comparison_videos(step=0, comparison_prompt_idx=0, comparison_seed=42)
+        # Save validation videos at step 0 (before any training)
+        if rl_cfg.video_save_interval is not None and self._validation_prompts:
+            self._save_validation_videos(step=0)
 
         self._accelerator.wait_for_everyone()
 
@@ -150,7 +173,7 @@ class RLTrainer:
             local_rewards = []
             local_individual_rewards = []
 
-            t0 = self._cuda_time()
+            t0 = self._wall_time()
 
             # Generate all samples in one batched forward pass
             gen_seeds = [
@@ -158,7 +181,7 @@ class RLTrainer:
                 for k in range(samples_per_gpu)
             ]
 
-            t_gen = self._cuda_time()
+            t_gen = self._wall_time()
             all_latents, all_positions, gen_sigmas = generate_video_latent(
                 transformer=self._transformer,
                 video_prompt_embeds=video_prompt_embeds,
@@ -170,7 +193,7 @@ class RLTrainer:
                 seed=gen_seeds,
                 device=device,
             )
-            total_gen_time = self._cuda_time() - t_gen
+            total_gen_time = self._wall_time() - t_gen
 
             # Decode and score each sample individually
             total_decode_time = 0.0
@@ -180,23 +203,20 @@ class RLTrainer:
                 latent = all_latents[k : k + 1]      # [1, seq_len, 128]
                 positions = all_positions[k : k + 1]  # [1, 3, seq_len, 2]
 
-                t_dec = self._cuda_time()
+                t_dec = self._wall_time()
                 pixel_video = self._decode_latent_to_pixels(latent, device) # [C, F, H, W]
-                total_decode_time += self._cuda_time() - t_dec
+                total_decode_time += self._wall_time() - t_dec
 
-                t_rew = self._cuda_time()
-                individual = {name: fn.compute(pixel_video) for fn, name in self._reward_fns}
+                t_rew = self._wall_time()
+                prompt_text = cached.prompt_text
+                individual = {name: fn.compute(pixel_video, prompt=prompt_text) for fn, name in self._reward_fns}
                 reward = sum(individual.values())
-                total_reward_time += self._cuda_time() - t_rew
+                total_reward_time += self._wall_time() - t_rew
 
                 local_latents.append(latent)
                 local_positions.append(positions)
                 local_rewards.append(reward)
                 local_individual_rewards.append(individual)
-
-                # Save generated video for first sub-sample only
-                if k == 0 and rl_cfg.video_save_interval is not None and IS_MAIN_PROCESS and (step + 1) % rl_cfg.video_save_interval == 0:
-                    self._save_labeled_video(pixel_video, step + 1, "generated")
 
                 del pixel_video
 
@@ -210,7 +230,7 @@ class RLTrainer:
             # ============================================================
             # Phase 2: GATHER all K rewards across GPUs
             # ============================================================
-            t0 = self._cuda_time()
+            t0 = self._wall_time()
             local_reward_tensor = torch.tensor(local_rewards, device=device, dtype=torch.float32)
             all_rewards = self._accelerator.gather(local_reward_tensor)  # [K]
 
@@ -221,22 +241,12 @@ class RLTrainer:
                     [d[name] for d in local_individual_rewards], device=device, dtype=torch.float32,
                 )
                 gathered_individual[name] = self._accelerator.gather(local_vals)  # [K]
-            timings["gather"] = self._cuda_time() - t0
-
-            # Log per-sample reward breakdown (all K samples)
-            if IS_MAIN_PROCESS:
-                logger.info(f"  Per-sample rewards (K={len(all_rewards)}):")
-                for i in range(len(all_rewards)):
-                    parts = " ".join(
-                        f"{name}={gathered_individual[name][i].item():+.4f}"
-                        for _, name in self._reward_fns
-                    )
-                    logger.info(
-                        f"    [{i:2d}] combined={all_rewards[i].item():+.4f} {parts}"
-                    )
+            timings["gather"] = self._wall_time() - t0
 
             # ============================================================
-            # Phase 3: TRAIN on each sub-sample (single timestep)
+            # Phase 3: TRAIN on each sub-sample (multi-timestep)
+            # Restructured: group by adapter to minimize adapter switches
+            # (3 switches instead of 4*num_timesteps).
             # ============================================================
             self._transformer.train()
 
@@ -253,138 +263,174 @@ class RLTrainer:
             # This GPU's advantages are at offset rank*samples_per_gpu
             local_offset = rank * samples_per_gpu
 
-            # Single random timestep from the generation sigma schedule
-            sigma_idx = torch.randint(0, len(gen_sigmas) - 1, (1,))
-            t_val = gen_sigmas[sigma_idx].float()
+            # Select random timestep indices from the generation sigma schedule
+            num_timesteps = min(rl_cfg.num_timesteps_per_sample, len(gen_sigmas) - 1)
+            sigma_indices = torch.randperm(len(gen_sigmas) - 1)[:num_timesteps]
 
             autocast_dtype = torch.bfloat16
             device_type = str(device).split(":")[0]
 
-            # Pre-compute noisy inputs for all samples at this timestep
-            sample_inputs: list[dict] = []
-            for k in range(samples_per_gpu):
-                latent = local_latents[k]
-                positions = local_positions[k]
-                r = all_advantages[local_offset + k]
-                r_tensor = torch.tensor([r], device=device, dtype=torch.float32)
+            # Total gradient accumulation divisor: we do one backward per
+            # timestep with a batched loss that already averages over
+            # samples_per_gpu, so divide by num_timesteps only.
+            total_grad_accum = num_timesteps
+            backward_pass_count = 0
 
-                seq_len = latent.shape[1]
-                t_expanded = t_val.view(1, 1, 1)
+            accumulated_metrics: dict[str, Tensor] = {}
 
-                noise = torch.randn_like(latent)
-                xt = (1 - t_expanded) * latent + t_expanded * noise
+            # ----------------------------------------------------------
+            # 1. Prepare ALL inputs for ALL timesteps upfront
+            # ----------------------------------------------------------
+            # all_inputs[t_idx] = list of dicts, one per sample
+            all_inputs: list[list[dict]] = []
+            # all_batched_modalities[t_idx] = batched Modality for this timestep
+            all_batched_modalities: list[Modality] = []
 
-                timesteps = t_val.expand(1, seq_len)
-                video_modality = Modality(
+            for t_idx in range(num_timesteps):
+                t_val = gen_sigmas[sigma_indices[t_idx]].float()
+                timestep_inputs: list[dict] = []
+                xt_list = []
+                ts_list = []
+                pos_list = []
+
+                for k in range(samples_per_gpu):
+                    latent = local_latents[k]
+                    positions = local_positions[k]
+                    r = all_advantages[local_offset + k]
+                    r_tensor = torch.tensor([r], device=device, dtype=torch.float32)
+
+                    seq_len = latent.shape[1]
+                    t_expanded = t_val.view(1, 1, 1)
+
+                    noise = torch.randn_like(latent)
+                    xt = (1 - t_expanded) * latent + t_expanded * noise
+
+                    timesteps = t_val.expand(1, seq_len)
+
+                    timestep_inputs.append({
+                        "latent": latent, "xt": xt, "t_expanded": t_expanded,
+                        "r_tensor": r_tensor,
+                    })
+                    xt_list.append(xt)
+                    ts_list.append(timesteps)
+                    pos_list.append(positions)
+
+                all_inputs.append(timestep_inputs)
+
+                # Build batched Modality for this timestep
+                batched_modality = Modality(
                     enabled=True,
-                    latent=xt,
-                    timesteps=timesteps,
-                    positions=positions,
-                    context=video_prompt_embeds,
+                    latent=torch.cat(xt_list, dim=0),
+                    timesteps=torch.cat(ts_list, dim=0),
+                    positions=torch.cat(pos_list, dim=0),
+                    context=video_prompt_embeds.expand(samples_per_gpu, -1, -1),
                     context_mask=None,
                 )
-                sample_inputs.append({
-                    "latent": latent, "xt": xt, "t_expanded": t_expanded,
-                    "t_scalar": t_val, "r": r, "r_tensor": r_tensor,
-                    "video_modality": video_modality,
-                })
+                all_batched_modalities.append(batched_modality)
 
-            # --- All fwd_new passes (default adapter, with grad) ---
-            t0 = self._cuda_time()
-            self._set_adapter("default")
-            total_adapter_switch += self._cuda_time() - t0
-
-            v_new_list = []
-            for k in range(samples_per_gpu):
-                t0 = self._cuda_time()
-                with torch.autocast(device_type=device_type, dtype=autocast_dtype):
-                    v_new, _ = self._transformer(
-                        video=sample_inputs[k]["video_modality"], audio=None, perturbations=None,
-                    )
-                v_new_list.append(v_new)
-                total_fwd_new += self._cuda_time() - t0
-
-            # --- All fwd_old passes (old adapter, no grad) ---
-            t0 = self._cuda_time()
+            # ----------------------------------------------------------
+            # 2. ALL fwd_old passes (1 adapter switch, no_grad, batched)
+            # ----------------------------------------------------------
+            t0 = self._wall_time()
             self._set_adapter("old")
-            total_adapter_switch += self._cuda_time() - t0
+            total_adapter_switch += self._wall_time() - t0
 
-            v_old_list = []
-            for k in range(samples_per_gpu):
-                t0 = self._cuda_time()
-                with torch.no_grad(), torch.autocast(device_type=device_type, dtype=autocast_dtype):
-                    v_old, _ = self._transformer(
-                        video=sample_inputs[k]["video_modality"], audio=None, perturbations=None,
+            v_old_all: list[Tensor] = []  # [num_timesteps] of [samples_per_gpu, seq, C]
+            t0 = self._wall_time()
+            with torch.no_grad(), torch.autocast(device_type=device_type, dtype=autocast_dtype):
+                for t_idx in range(num_timesteps):
+                    v_old_batched, _ = self._transformer(
+                        video=all_batched_modalities[t_idx], audio=None, perturbations=None,
                     )
-                v_old_list.append(v_old)
-                total_fwd_old += self._cuda_time() - t0
+                    v_old_all.append(v_old_batched.detach())
+            total_fwd_old = self._wall_time() - t0
 
-            # --- All fwd_ref passes (base model, no LoRA, no grad) ---
+            # ----------------------------------------------------------
+            # 3. ALL fwd_ref passes (disable adapters, no_grad, batched)
+            # ----------------------------------------------------------
             unwrapped = self._accelerator.unwrap_model(self._transformer)
-            t0 = self._cuda_time()
-            unwrapped.base_model.disable_adapter_layers()
-            unwrapped._adapters_disabled = True
-            total_adapter_switch += self._cuda_time() - t0
+            t0 = self._wall_time()
 
-            v_ref_list = []
-            for k in range(samples_per_gpu):
-                t0 = self._cuda_time()
+            v_ref_all: list[Tensor] = []  # [num_timesteps] of [samples_per_gpu, seq, C]
+            with unwrapped.disable_adapter():
+                total_adapter_switch += self._wall_time() - t0
+                t0 = self._wall_time()
                 with torch.no_grad(), torch.autocast(device_type=device_type, dtype=autocast_dtype):
-                    v_ref, _ = self._transformer(
-                        video=sample_inputs[k]["video_modality"], audio=None, perturbations=None,
-                    )
-                v_ref_list.append(v_ref)
-                total_fwd_ref += self._cuda_time() - t0
+                    for t_idx in range(num_timesteps):
+                        v_ref_batched, _ = self._transformer(
+                            video=all_batched_modalities[t_idx], audio=None, perturbations=None,
+                        )
+                        v_ref_all.append(v_ref_batched.detach())
+            total_fwd_ref = self._wall_time() - t0
 
-            t0 = self._cuda_time()
-            unwrapped.base_model.enable_adapter_layers()
-            unwrapped._adapters_disabled = False
+            # ----------------------------------------------------------
+            # 4. fwd_new + loss + backward (default adapter, with grad)
+            #    One batched fwd + backward per timestep.
+            # ----------------------------------------------------------
+            t0 = self._wall_time()
             self._set_adapter("default")
-            total_adapter_switch += self._cuda_time() - t0
+            total_adapter_switch += self._wall_time() - t0
 
-            # --- Loss + backward for each sample, with manual DDP sync ---
-            accumulated_metrics: dict[str, float] = {}
-            for k in range(samples_per_gpu):
-                si = sample_inputs[k]
+            for t_idx in range(num_timesteps):
+                t0 = self._wall_time()
+                with torch.autocast(device_type=device_type, dtype=autocast_dtype):
+                    v_new_batched, _ = self._transformer(
+                        video=all_batched_modalities[t_idx], audio=None, perturbations=None,
+                    )
+                total_fwd_new += self._wall_time() - t0
 
-                t0 = self._cuda_time()
+                # Build batched tensors for NFT loss
+                batched_xt = torch.cat([si["xt"] for si in all_inputs[t_idx]], dim=0)
+                batched_x0 = torch.cat([si["latent"] for si in all_inputs[t_idx]], dim=0)
+                batched_t = torch.cat([si["t_expanded"] for si in all_inputs[t_idx]], dim=0)
+                batched_r = torch.cat([si["r_tensor"] for si in all_inputs[t_idx]], dim=0)
+
+                t0 = self._wall_time()
                 loss, metrics = compute_nft_loss(
-                    xt=si["xt"],
-                    x0=si["latent"],
-                    t=si["t_expanded"],
-                    forward_pred=v_new_list[k],
-                    old_pred=v_old_list[k].detach(),
-                    ref_pred=v_ref_list[k].detach(),
-                    r=si["r_tensor"],
+                    xt=batched_xt,
+                    x0=batched_x0,
+                    t=batched_t,
+                    forward_pred=v_new_batched,
+                    old_pred=v_old_all[t_idx].detach(),
+                    ref_pred=v_ref_all[t_idx].detach(),
+                    r=batched_r,
                     beta=rl_cfg.nft_beta,
                     kl_beta=rl_cfg.kl_beta,
                 )
-                loss = loss / samples_per_gpu
-                total_nft_loss += self._cuda_time() - t0
+                loss = loss / total_grad_accum
+                total_nft_loss += self._wall_time() - t0
 
-                # Accumulate metrics for logging
+                # Accumulate metrics as tensors (no .item() yet)
                 for mkey, mval in metrics.items():
-                    accumulated_metrics[mkey] = accumulated_metrics.get(mkey, 0.0) + mval / samples_per_gpu
+                    if mkey not in accumulated_metrics:
+                        accumulated_metrics[mkey] = mval / total_grad_accum
+                    else:
+                        accumulated_metrics[mkey] = accumulated_metrics[mkey] + mval / total_grad_accum
 
-                t0 = self._cuda_time()
-                if k < samples_per_gpu - 1:
-                    # No DDP sync for intermediate samples
+                t0 = self._wall_time()
+                backward_pass_count += 1
+                if backward_pass_count < total_grad_accum:
                     with self._accelerator.no_sync(self._transformer):
                         self._accelerator.backward(loss)
                 else:
-                    # DDP sync on the last sample
+                    # DDP sync on the very last backward pass
                     self._accelerator.backward(loss)
-                total_backward += self._cuda_time() - t0
+                total_backward += self._wall_time() - t0
+
+                del v_new_batched
+
+            del v_old_all, v_ref_all, all_batched_modalities, all_inputs
+
+            # Convert accumulated tensor metrics to floats
+            accumulated_metrics = {k: v.item() for k, v in accumulated_metrics.items()}
 
             # Optimizer step
-            t0 = self._cuda_time()
+            t0 = self._wall_time()
             if cfg.optimization.max_grad_norm > 0:
                 self._accelerator.clip_grad_norm_(trainable_params, cfg.optimization.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad()
-            total_opt_step = self._cuda_time() - t0
-
-            del v_new_list, v_old_list, v_ref_list, sample_inputs
+            total_opt_step = self._wall_time() - t0
 
             timings["adapter_switch"] = total_adapter_switch
             timings["fwd_new"] = total_fwd_new
@@ -400,13 +446,13 @@ class RLTrainer:
             # ============================================================
             # 4. DECAY old adapter (every old_update_interval optimizer steps)
             # ============================================================
-            t0 = self._cuda_time()
+            t0 = self._wall_time()
             opt_step_num = step + 1
             decay_value = -1.0
             if opt_step_num % rl_cfg.old_update_interval == 0:
                 decay_value = min(opt_step_num * rl_cfg.decay_rate, rl_cfg.max_decay)
                 self._decay_old_adapter(decay_value)
-            timings["decay"] = self._cuda_time() - t0
+            timings["decay"] = self._wall_time() - t0
 
             # ============================================================
             # 5. LOG
@@ -416,6 +462,7 @@ class RLTrainer:
 
             if IS_MAIN_PROCESS:
                 mean_reward = all_rewards.mean().item()
+                std_reward = all_rewards.std().item() if len(all_rewards) > 1 else 0.0
                 max_reward = all_rewards.max().item()
                 min_reward = all_rewards.min().item()
 
@@ -427,46 +474,54 @@ class RLTrainer:
                     "rl/pos_loss": accumulated_metrics["pos_loss"],
                     "rl/neg_loss": accumulated_metrics["neg_loss"],
                     "rl/mean_reward": mean_reward,
+                    "rl/reward_std": std_reward,
                     "rl/max_reward": max_reward,
                     "rl/min_reward": min_reward,
                     "rl/mean_advantage": mean_advantage,
                     "rl/decay": decay_value,
                     "rl/step_time": step_time,
+                    "rl/num_timesteps_per_sample": num_timesteps,
                 }
-                # Log individual reward means (all K samples)
+                # Log individual reward means and stds (all K samples)
                 for _, name in self._reward_fns:
                     log_metrics[f"rl/reward/{name}"] = gathered_individual[name].mean().item()
+                    log_metrics[f"rl/reward/{name}_std"] = gathered_individual[name].std().item() if len(gathered_individual[name]) > 1 else 0.0
                 # Log all timings to W&B
                 for tname, tval in timings.items():
                     log_metrics[f"rl/time/{tname}"] = tval
                 self._log_metrics(log_metrics)
 
-                # Build timing summary string
-                timing_str = " | ".join(f"{k}={v:.1f}s" for k, v in timings.items())
-
-                # Build individual reward string
+                # Build per-reward detail string
                 reward_parts = []
                 for _, name in self._reward_fns:
-                    reward_parts.append(f"{name}={gathered_individual[name].mean().item():.4f}")
-                reward_detail = " ".join(reward_parts)
+                    r_mean = gathered_individual[name].mean().item()
+                    r_std = gathered_individual[name].std().item() if len(gathered_individual[name]) > 1 else 0.0
+                    reward_parts.append(f"{name}: \u03bc={r_mean:.2f} \u03c3={r_std:.2f}")
+                reward_detail = " | ".join(reward_parts)
+
+                kl_raw = accumulated_metrics["kl_loss"]
+                kl_weighted = rl_cfg.kl_beta * kl_raw
+
+                gen_time = timings.get("generation", 0.0)
+                rew_time = timings.get("decode", 0.0) + timings.get("reward", 0.0)
+                train_time = timings.get("phase3_total", 0.0)
 
                 logger.info(
                     f"Step {step + 1}/{num_steps} | "
-                    f"loss={accumulated_metrics['total_loss']:.4f} "
-                    f"(policy={accumulated_metrics['policy_loss']:.1f} kl={accumulated_metrics['kl_loss']:.6f} "
-                    f"kl_weighted={rl_cfg.kl_beta * accumulated_metrics['kl_loss']:.4f}) | "
-                    f"reward={mean_reward:.4f} [{min_reward:.4f}, {max_reward:.4f}] | "
+                    f"loss={accumulated_metrics['total_loss']:.3f} "
+                    f"(pol={accumulated_metrics['policy_loss']:.1f} "
+                    f"kl={kl_raw:.2f}\u00d7{rl_cfg.kl_beta}={kl_weighted:.3f}) | "
+                    f"reward: \u03bc={mean_reward:.2f} \u03c3={std_reward:.2f} [{min_reward:.2f}, {max_reward:.2f}] | "
                     f"{reward_detail} | "
                     f"adv={mean_advantage:.3f} | "
-                    f"time={step_time:.1f}s"
+                    f"{step_time:.1f}s (gen={gen_time:.1f} rew={rew_time:.1f} train={train_time:.1f})"
                 )
-                logger.info(f"  Timings: {timing_str}")
 
-            # Save comparison videos periodically
-            if rl_cfg.video_save_interval is not None and (step + 1) % rl_cfg.video_save_interval == 0:
-                self._save_comparison_videos(
-                    step=step + 1, comparison_prompt_idx=0, comparison_seed=42,
-                )
+            # Save validation videos periodically
+            if rl_cfg.video_save_interval is not None and self._validation_prompts and (step + 1) % rl_cfg.video_save_interval == 0:
+                self._save_validation_videos(step=step + 1)
+                if rl_cfg.validation_grid_interval and (step + 1) % rl_cfg.validation_grid_interval == 0:
+                    self._generate_validation_grid(step + 1)
 
             # Save checkpoint
             if rl_cfg.checkpoint_save_interval and (step + 1) % rl_cfg.checkpoint_save_interval == 0:
@@ -474,9 +529,11 @@ class RLTrainer:
 
             self._accelerator.wait_for_everyone()
 
-        # Final comparison videos + checkpoint
-        if rl_cfg.video_save_interval is not None:
-            self._save_comparison_videos(step=num_steps, comparison_prompt_idx=0, comparison_seed=42)
+        # Final validation videos + grid + checkpoint
+        if rl_cfg.video_save_interval is not None and self._validation_prompts:
+            self._save_validation_videos(step=num_steps)
+            if rl_cfg.validation_grid_interval:
+                self._generate_validation_grid(num_steps)
         self._save_checkpoint(num_steps)
 
         if IS_MAIN_PROCESS and self._wandb_run is not None:
@@ -490,43 +547,99 @@ class RLTrainer:
     # Model loading and setup
     # ========================================================================
 
-    def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings]:
-        """Load text encoder, cache all prompt embeddings, unload heavy parts."""
-        logger.debug("Loading text encoder...")
-        text_encoder = load_text_encoder(
-            checkpoint_path=self._config.model.model_path,
-            gemma_model_path=self._config.model.text_encoder_path,
-            device="cuda",
-            dtype=torch.bfloat16,
-            load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
+    def _load_text_encoder_and_cache_embeddings(
+        self,
+    ) -> tuple[list[CachedPromptEmbeddings] | LazyEmbeddingStore, list[_ValidationPrompt]]:
+        """Load text encoder, cache all prompt embeddings, unload heavy parts.
+
+        If ``precomputed_embeddings_dir`` is set, training embeddings are loaded
+        lazily from disk (one .pt file per prompt) instead of being encoded at
+        startup.  The text encoder is still loaded briefly when validation
+        prompts are configured.
+        """
+        rl_cfg = self._rl_config
+        need_text_encoder = (
+            rl_cfg.precomputed_embeddings_dir is None
+            or rl_cfg.validation_prompts_file is not None
         )
 
-        # Read prompts from file
-        prompts_path = Path(self._rl_config.prompts_file)
-        prompts = [line.strip() for line in prompts_path.read_text().splitlines() if line.strip()]
-        logger.info(f"Loaded {len(prompts)} prompts from {prompts_path}")
+        text_encoder = None
+        if need_text_encoder:
+            logger.debug("Loading text encoder...")
+            text_encoder = load_text_encoder(
+                checkpoint_path=self._config.model.model_path,
+                gemma_model_path=self._config.model.text_encoder_path,
+                device="cuda",
+                dtype=torch.bfloat16,
+                load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
+            )
 
-        # Cache embeddings for all prompts
-        cached = []
-        with torch.inference_mode():
-            for prompt in prompts:
-                v_ctx, a_ctx, _ = text_encoder(prompt)
-                cached.append(
-                    CachedPromptEmbeddings(
-                        video_context_positive=v_ctx.cpu(),
-                        audio_context_positive=a_ctx.cpu(),
+        # --- Training embeddings ---
+        if rl_cfg.precomputed_embeddings_dir is not None:
+            cached: list[CachedPromptEmbeddings] | LazyEmbeddingStore = LazyEmbeddingStore(
+                embeddings_dir=rl_cfg.precomputed_embeddings_dir,
+                prompts_file=rl_cfg.prompts_file,
+            )
+            logger.info(
+                f"Using lazy embedding store: {len(cached)} prompts from "
+                f"{rl_cfg.precomputed_embeddings_dir}"
+            )
+        else:
+            # Read training prompts from file
+            prompts_path = Path(rl_cfg.prompts_file)
+            prompts = [line.strip() for line in prompts_path.read_text().splitlines() if line.strip()]
+            logger.info(f"Loaded {len(prompts)} prompts from {prompts_path}")
+
+            # Cache embeddings for all training prompts
+            cached = []
+            with torch.inference_mode():
+                for prompt in prompts:
+                    v_ctx, a_ctx, _ = text_encoder(prompt)
+                    cached.append(
+                        CachedPromptEmbeddings(
+                            video_context_positive=v_ctx.cpu(),
+                            audio_context_positive=a_ctx.cpu(),
+                            prompt_text=prompt,
+                        )
+                    )
+
+        # Cache validation prompt embeddings (if configured)
+        validation_prompts: list[_ValidationPrompt] = []
+        if rl_cfg.validation_prompts_file is not None:
+            vp_path = Path(rl_cfg.validation_prompts_file)
+            for line in vp_path.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                nickname, prompt_text = line.split("|", 1)
+                nickname = nickname.strip()
+                prompt_text = prompt_text.strip()
+                with torch.inference_mode():
+                    v_ctx, a_ctx, _ = text_encoder(prompt_text)
+                validation_prompts.append(
+                    _ValidationPrompt(
+                        nickname=nickname,
+                        embeddings=CachedPromptEmbeddings(
+                            video_context_positive=v_ctx.cpu(),
+                            audio_context_positive=a_ctx.cpu(),
+                            prompt_text=prompt_text,
+                        ),
                     )
                 )
+            logger.info(f"Cached embeddings for {len(validation_prompts)} validation prompts.")
 
         # Keep the embedding connectors, unload heavy Gemma model
-        self._text_encoder = text_encoder
-        self._text_encoder.model = None
-        self._text_encoder.tokenizer = None
-        self._text_encoder.feature_extractor_linear = None
+        if text_encoder is not None:
+            self._text_encoder = text_encoder
+            self._text_encoder.model = None
+            self._text_encoder.tokenizer = None
+            self._text_encoder.feature_extractor_linear = None
+        else:
+            self._text_encoder = None
 
         free_gpu_memory()
-        logger.info(f"Cached embeddings for {len(cached)} prompts. Text encoder unloaded.")
-        return cached
+        logger.info(f"Training embeddings ready: {len(cached)} prompts. Text encoder unloaded.")
+        return cached, validation_prompts
 
     def _load_models(self) -> None:
         """Load transformer, VAE decoder, and scheduler."""
@@ -735,34 +848,22 @@ class RLTrainer:
     # Saving
     # ========================================================================
 
-    def _save_labeled_video(self, pixel_video: Tensor, step: int, label: str) -> None:
-        """Save a video to disk with a descriptive label."""
-        output_dir = Path(self._config.output_dir) / "samples"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"step_{step:05d}_{label}.mp4"
-        save_video(
-            video_tensor=pixel_video,
-            output_path=output_path,
-            fps=self._rl_config.frame_rate,
-        )
+    def _save_validation_videos(self, step: int) -> None:
+        """Generate and save one validation video per GPU using the old adapter.
 
-    def _save_comparison_videos(
-        self, step: int, comparison_prompt_idx: int, comparison_seed: int,
-    ) -> None:
-        """Generate and save comparison videos: old adapter, new adapter, base model.
-
-        Uses a fixed prompt and seed so videos are directly comparable across steps.
-        All GPUs generate (required by DDP), but only rank 0 saves.
+        Each GPU generates its rank-th validation prompt with a fixed seed,
+        producing files like `samples/step_00000_dog.mp4`.
         """
         device = self._accelerator.device
+        rank = self._accelerator.process_index
         rl_cfg = self._rl_config
-        cached = self._cached_prompt_embeddings[comparison_prompt_idx]
-        video_prompt_embeds = cached.video_context_positive.to(device)
+
+        vp = self._validation_prompts[rank]
+        video_prompt_embeds = vp.embeddings.video_context_positive.to(device)
 
         self._transformer.eval()
-
-        # Save only old adapter video (cheapest — avoids extra generation passes)
         self._set_adapter("old")
+
         latent, _, _ = generate_video_latent(
             transformer=self._transformer,
             video_prompt_embeds=video_prompt_embeds,
@@ -771,25 +872,51 @@ class RLTrainer:
             width=rl_cfg.generation_width,
             num_steps=rl_cfg.generation_steps,
             frame_rate=rl_cfg.frame_rate,
-            seed=comparison_seed,
+            seed=42,
             device=device,
         )
         pixel_video = self._decode_latent_to_pixels(latent, device)
-        if IS_MAIN_PROCESS:
-            self._save_labeled_video(pixel_video, step, "old")
+
+        output_dir = Path(self._config.output_dir) / "samples"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"step_{step:05d}_{vp.nickname}.mp4"
+        save_video(video_tensor=pixel_video, output_path=output_path, fps=rl_cfg.frame_rate)
+
         del pixel_video, latent
         free_gpu_memory()
 
-        if IS_MAIN_PROCESS:
-            logger.info(f"Saved old adapter video at step {step}")
-
+        logger.info(f"Saved validation video: {output_path.name}")
         self._accelerator.wait_for_everyone()
+
+    def _generate_validation_grid(self, step: int) -> None:
+        """Run the validation_grid.py script to create a grid video."""
+        if not IS_MAIN_PROCESS:
+            return
+
+        samples_dir = Path(self._config.output_dir) / "samples"
+        if not samples_dir.is_dir():
+            return
+
+        script = Path(__file__).resolve().parents[5] / "scripts" / "validation_grid.py"
+        if not script.exists():
+            logger.warning(f"validation_grid.py not found at {script}")
+            return
+
+        cmd = [sys.executable, str(script), str(samples_dir), "--limit", "10"]
+        if self._rl_config.validation_prompts_file:
+            cmd.extend(["--prompts-file", str(self._rl_config.validation_prompts_file)])
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            logger.info(f"Validation grid generated at step {step}")
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Failed to generate validation grid: {e.stderr[:200]}")
 
     def _save_checkpoint(self, step: int) -> None:
-        """Save LoRA checkpoint (default adapter weights only)."""
+        """Save LoRA checkpoint (old adapter weights)."""
         self._accelerator.wait_for_everyone()
 
-        self._set_adapter("default")
+        self._set_adapter("old")
         # Collective op — all processes must call this even if only main saves
         self._accelerator.get_state_dict(self._transformer)
 
@@ -857,6 +984,11 @@ class RLTrainer:
     def _cuda_time() -> float:
         """Return wall-clock time after synchronizing CUDA for accurate timing."""
         torch.cuda.synchronize()
+        return time.time()
+
+    @staticmethod
+    def _wall_time() -> float:
+        """Return wall-clock time without CUDA sync (for inner-loop timing)."""
         return time.time()
 
     def _log_metrics(self, metrics: dict[str, float]) -> None:

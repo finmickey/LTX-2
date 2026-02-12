@@ -32,6 +32,7 @@ dependencies = [
     "typer>=0.15.1",
     "wandb>=0.19.11",
     "setuptools>=79.0.0",
+    "mantis-vl",
 ]
 
 [dependency-groups]

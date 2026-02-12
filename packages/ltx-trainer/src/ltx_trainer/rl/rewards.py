@@ -6,8 +6,10 @@ Each reward function scores a video tensor and returns a scalar reward.
 import logging
 from abc import ABC, abstractmethod
 
+import numpy as np
 import torch
 from torch import Tensor
+from torchvision.transforms import functional as TF
 
 logger = logging.getLogger(__name__)
 _logged_shapes = False
@@ -17,11 +19,12 @@ class RewardFunction(ABC):
     """Abstract base class for reward functions."""
 
     @abstractmethod
-    def compute(self, video: Tensor) -> float:
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         """Score a video.
 
         Args:
             video: Video tensor [C, F, H, W] in [0, 1] range.
+            prompt: Text prompt used to generate the video.
 
         Returns:
             Scalar reward value.
@@ -35,7 +38,7 @@ class RednessReward(RewardFunction):
     Higher values indicate redder videos.
     """
 
-    def compute(self, video: Tensor) -> float:
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         r, g, b = video[0], video[1], video[2]
         return (r - torch.max(g, b)).mean().item()
 
@@ -47,7 +50,7 @@ class BluenessReward(RewardFunction):
     Higher values indicate bluer videos.
     """
 
-    def compute(self, video: Tensor) -> float:
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         r, g, b = video[0], video[1], video[2]
         return (b - torch.max(r, g)).mean().item()
 
@@ -59,7 +62,7 @@ class HorizontalEdgeReward(RewardFunction):
     Uniform frames score ~0, horizontally-striped frames score high.
     """
 
-    def compute(self, video: Tensor) -> float:
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         return (video[:, :, 1:, :] - video[:, :, :-1, :]).abs().mean().item()
 
 
@@ -73,7 +76,7 @@ class HorizontalStripeReward(RewardFunction):
 
     BAND_HEIGHT = 4
 
-    def compute(self, video: Tensor) -> float:
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         # video: [C, F, H, W]
         _C, _F, H, _W = video.shape
         n_bands = H // self.BAND_HEIGHT
@@ -92,7 +95,7 @@ class UniformFrameReward(RewardFunction):
     frames score 0; noisy/textured frames score negative.
     """
 
-    def compute(self, video: Tensor) -> float:
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         global _logged_shapes
         # video: [C, F, H, W]
         if not _logged_shapes:
@@ -119,7 +122,7 @@ class RedOrBlueReward(RewardFunction):
     Black scores 0, pure red/blue scores +1, alternating red/blue scores +1.
     """
 
-    def compute(self, video: Tensor) -> float:
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         r, g, b = video[0], video[1], video[2]  # [F, H, W]
         redness = (r - torch.max(g, b)).mean(dim=(1, 2))  # [F]
         blueness = (b - torch.max(r, g)).mean(dim=(1, 2))  # [F]
@@ -134,7 +137,7 @@ class FrameContrastReward(RewardFunction):
     All-same-color scores 0, alternating red/blue scores ~2.0.
     """
 
-    def compute(self, video: Tensor) -> float:
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         # video: [C, F, H, W] — mean color per frame: [C, F]
         frame_colors = video.mean(dim=(2, 3))
         if frame_colors.shape[1] < 2:
@@ -157,7 +160,7 @@ class ColorAlternationReward(RewardFunction):
     Scores: black=0, all-red=0, all-blue=0, alternating R/B=0.50
     """
 
-    def compute(self, video: Tensor) -> float:
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         r, g, b = video[0], video[1], video[2]  # [F, H, W]
         redness = (r - torch.max(g, b)).mean(dim=(1, 2))  # [F]
         blueness = (b - torch.max(r, g)).mean(dim=(1, 2))  # [F]
@@ -185,7 +188,7 @@ class ChangingColorsReward(RewardFunction):
 
     LOOKBACK = 5
 
-    def compute(self, video: Tensor) -> float:
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         global _logged_shapes
         # video: [C, F, H, W] — get mean color per frame: [C, F]
         frame_colors = video.mean(dim=(2, 3))
@@ -231,16 +234,137 @@ class ChangingColorsReward(RewardFunction):
         return result
 
 
-def get_reward_function(name: str) -> RewardFunction:
-    """Factory function to get a reward function by name.
+REGRESSION_QUERY_PROMPT = """
+Suppose you are an expert in judging and evaluating the quality of AI-generated videos,
+please watch the following frames of a given video and see the text prompt that was used to generate the video,
+then give scores from 5 perspectives:
+(1) visual_quality: the quality of the video in terms of clearness, resolution, brightness, and color
+(2) temporal_consistency, the consistency of objects, characters and backgrounds across different frames of the video
+(3) dynamic_degree, the degree of dynamic changes
+(4) text_to_video_alignment, the alignment between the text prompt and the video content
+(5) factual_consistency, the consistency of the video content with the common-sense and factual knowledge
+
+For each dimension, output a float number from 1.0 to 4.0,
+the higher the number is, the better the video performs in that sub-score, respectively.
+
+The output format should be:
+visual_quality: x.x, temporal_consistency: x.x, dynamic_degree: x.x, text_to_video_alignment: x.x, factual_consistency: x.x
+
+Here is the prompt of the video: {text_prompt}
+
+Here are the frames of the video:
+""".strip()
+
+
+class _VideoScoreModel:
+    """Shared VideoScore-v1.1 model (loaded once, used by all dimension rewards)."""
+
+    DIMENSIONS = [
+        "visual_quality",
+        "temporal_consistency",
+        "dynamic_degree",
+        "text_to_video_alignment",
+        "factual_consistency",
+    ]
+
+    # Dimension weights: text_to_video_alignment gets 2x
+    DIMENSION_WEIGHTS = {
+        "text_to_video_alignment": 2.0,
+    }
+
+    def __init__(self, model_name: str = "TIGER-Lab/VideoScore-v1.1", max_num_frames: int = 48) -> None:
+        # Patch DynamicCache for mantis compatibility with newer transformers
+        from transformers import DynamicCache
+        if not hasattr(DynamicCache, "get_usable_length"):
+            DynamicCache.get_usable_length = DynamicCache.get_seq_length
+
+        from mantis.models.idefics2 import Idefics2ForSequenceClassification
+        from transformers import AutoProcessor
+
+        self._processor = AutoProcessor.from_pretrained(model_name)
+        self._model = (
+            Idefics2ForSequenceClassification.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+            .eval()
+            .to("cuda")
+        )
+        self._max_num_frames = max_num_frames
+        self._cache_key: int | None = None
+        self._cache_scores: list[float] | None = None
+
+    def get_dimension_score(self, video: Tensor, prompt: str, dim_idx: int) -> float:
+        """Get score for a specific dimension, computing all scores on first call per video."""
+        vid_key = id(video)
+        if self._cache_key != vid_key:
+            self._cache_scores = self._compute_all(video, prompt)
+            self._cache_key = vid_key
+        return self._cache_scores[dim_idx]
+
+    def _compute_all(self, video: Tensor, prompt: str) -> list[float]:
+        """Run VideoScore model and return all dimension scores."""
+        frames = video.permute(1, 0, 2, 3)  # [F, C, H, W]
+        num_frames = frames.shape[0]
+        if num_frames > self._max_num_frames:
+            indices = np.linspace(0, num_frames - 1, self._max_num_frames, dtype=int)
+            frames = frames[indices]
+
+        pil_frames = [TF.to_pil_image(f) for f in frames]
+
+        eval_prompt = REGRESSION_QUERY_PROMPT.format(text_prompt=prompt)
+        num_image_token = eval_prompt.count("<image>")
+        if num_image_token < len(pil_frames):
+            eval_prompt += "<image> " * (len(pil_frames) - num_image_token)
+
+        inputs = self._processor(text=eval_prompt, images=pil_frames, return_tensors="pt")
+        inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+
+        with torch.inference_mode():
+            outputs = self._model(**inputs)
+
+        logits = outputs.logits  # [1, 5]
+        return logits[0].tolist()
+
+
+class VideoScoreDimensionReward(RewardFunction):
+    """Single dimension of VideoScore-v1.1."""
+
+    def __init__(self, model: _VideoScoreModel, dim_idx: int, weight: float = 1.0) -> None:
+        self._model = model
+        self._dim_idx = dim_idx
+        self._weight = weight
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        score = self._model.get_dimension_score(video, prompt, self._dim_idx)
+        return score * self._weight
+
+
+_video_score_model: _VideoScoreModel | None = None
+
+
+def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
+    """Factory function to get reward function(s) by name.
+
+    Most reward types return a single (function, name) pair.
+    'video_score' expands into one reward per dimension (5 total),
+    so each dimension is logged and tracked independently.
 
     Args:
         name: Name of the reward function.
 
     Returns:
-        An instance of the requested reward function.
+        List of (RewardFunction, display_name) tuples.
     """
-    reward_functions = {
+    if name == "video_score":
+        global _video_score_model
+        if _video_score_model is None:
+            _video_score_model = _VideoScoreModel()
+        result = []
+        for idx, dim_name in enumerate(_VideoScoreModel.DIMENSIONS):
+            weight = _VideoScoreModel.DIMENSION_WEIGHTS.get(dim_name, 1.0)
+            reward = VideoScoreDimensionReward(_video_score_model, idx, weight)
+            result.append((reward, f"videoscore_{dim_name}"))
+        return result
+
+    reward_classes: dict[str, type[RewardFunction]] = {
         "redness": RednessReward,
         "blueness": BluenessReward,
         "horizontal_edges": HorizontalEdgeReward,
@@ -252,7 +376,8 @@ def get_reward_function(name: str) -> RewardFunction:
         "color_alternation": ColorAlternationReward,
     }
 
-    if name not in reward_functions:
-        raise ValueError(f"Unknown reward function: {name}. Available: {list(reward_functions.keys())}")
+    if name not in reward_classes:
+        available = list(reward_classes.keys()) + ["video_score"]
+        raise ValueError(f"Unknown reward function: {name}. Available: {available}")
 
-    return reward_functions[name]()
+    return [(reward_classes[name](), name)]

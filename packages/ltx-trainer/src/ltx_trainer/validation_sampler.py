@@ -52,6 +52,7 @@ class CachedPromptEmbeddings:
     audio_context_positive: Tensor  # [1, seq_len, hidden_dim]
     video_context_negative: Tensor | None = None
     audio_context_negative: Tensor | None = None
+    prompt_text: str = ""
 
 
 @dataclass
