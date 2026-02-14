@@ -20,6 +20,7 @@ def compute_nft_loss(
     r: Tensor,
     beta: float,
     kl_beta: float,
+    adv_clip_max: float = 5.0,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Compute the DiffusionNFT loss.
 
@@ -33,6 +34,7 @@ def compute_nft_loss(
         r: Advantage weight [B] in [0, 1].
         beta: NFT interpolation weight.
         kl_beta: KL regularization weight.
+        adv_clip_max: Advantage clipping maximum; scales policy loss.
 
     Returns:
         Tuple of (total_loss, metrics_dict with detached tensors).
@@ -67,10 +69,12 @@ def compute_nft_loss(
     # KL regularization: penalize deviation from base model
     kl_loss = ((forward_pred - ref_pred) ** 2).mean()
 
-    total_loss = policy_loss.mean() + kl_beta * kl_loss
+    policy_loss_unscaled = policy_loss.mean()
+    total_loss = (policy_loss * adv_clip_max).mean() + kl_beta * kl_loss
 
     metrics = {
-        "policy_loss": policy_loss.mean().detach(),
+        "policy_loss": policy_loss_unscaled.detach(),
+        "policy_loss_scaled": (policy_loss * adv_clip_max).mean().detach(),
         "kl_loss": kl_loss.detach(),
         "pos_loss": pos_loss.mean().detach(),
         "neg_loss": neg_loss.mean().detach(),

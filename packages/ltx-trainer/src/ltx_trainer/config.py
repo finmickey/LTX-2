@@ -539,6 +539,14 @@ class RLConfig(ConfigBaseModel):
         ge=0,
     )
 
+    adv_clip_max: float = Field(
+        default=5.0,
+        description="Maximum absolute value for advantage clipping. "
+        "Advantages are clipped to [-adv_clip_max, adv_clip_max] before normalization. "
+        "Also scales the policy loss. Reference DiffusionNFT uses 5.0.",
+        gt=0,
+    )
+
     num_timesteps_per_sample: int = Field(
         default=1,
         description="Number of random timesteps per sample per optimizer step. "

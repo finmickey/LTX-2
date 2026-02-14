@@ -259,7 +259,7 @@ class RLTrainer:
             t_phase3 = self._cuda_time()
 
             # Compute advantages for all K samples at once
-            all_advantages = self._compute_advantages(all_rewards)
+            all_advantages = self._compute_advantages(all_rewards, adv_clip_max=rl_cfg.adv_clip_max)
             # This GPU's advantages are at offset rank*samples_per_gpu
             local_offset = rank * samples_per_gpu
 
@@ -396,6 +396,7 @@ class RLTrainer:
                     r=batched_r,
                     beta=rl_cfg.nft_beta,
                     kl_beta=rl_cfg.kl_beta,
+                    adv_clip_max=rl_cfg.adv_clip_max,
                 )
                 loss = loss / total_grad_accum
                 total_nft_loss += self._wall_time() - t0
@@ -782,14 +783,16 @@ class RLTrainer:
     # Reward and advantage computation
     # ========================================================================
 
-    def _compute_advantages(self, all_rewards: Tensor) -> list[float]:
+    def _compute_advantages(self, all_rewards: Tensor, adv_clip_max: float = 5.0) -> list[float]:
         """Compute batch-normalized advantages for all K rewards.
 
-        Normalizes rewards within the current batch (z-score), clips to [-1, 1],
-        and maps to [0, 1] for use as NFT interpolation weights.
+        Normalizes rewards within the current batch (z-score), clips to
+        [-adv_clip_max, adv_clip_max], and maps to [0, 1] for use as NFT
+        interpolation weights.
 
         Args:
             all_rewards: All rewards gathered across GPUs [K].
+            adv_clip_max: Maximum absolute value for advantage clipping.
 
         Returns:
             List of advantage values r in [0, 1], one per reward in all_rewards.
@@ -800,8 +803,8 @@ class RLTrainer:
         result = []
         for r in rewards:
             adv = (r - mean) / std
-            adv = max(-1.0, min(1.0, adv))  # clip to [-1, 1]
-            result.append(adv * 0.5 + 0.5)  # map to [0, 1]
+            adv = max(-adv_clip_max, min(adv_clip_max, adv))  # clip to [-adv_clip_max, adv_clip_max]
+            result.append(adv / adv_clip_max / 2.0 + 0.5)  # map to [0, 1]
         return result
 
     # ========================================================================
