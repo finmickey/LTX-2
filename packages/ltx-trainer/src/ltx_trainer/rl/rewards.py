@@ -8,6 +8,8 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torchvision.transforms as T
 from torch import Tensor
 from torchvision.transforms import functional as TF
 
@@ -267,10 +269,7 @@ class _VideoScoreModel:
         "factual_consistency",
     ]
 
-    # Dimension weights: text_to_video_alignment gets 2x
-    DIMENSION_WEIGHTS = {
-        "text_to_video_alignment": 2.0,
-    }
+    DIMENSION_WEIGHTS = {}
 
     def __init__(self, model_name: str = "TIGER-Lab/VideoScore-v1.1", max_num_frames: int = 48) -> None:
         # Patch DynamicCache for mantis compatibility with newer transformers
@@ -324,6 +323,74 @@ class _VideoScoreModel:
         return logits[0].tolist()
 
 
+def _get_clip_image_transform(size: int = 224) -> T.Compose:
+    """Build a torchvision transform matching CLIPProcessor for tensor inputs."""
+    return T.Compose([
+        T.Resize(size, interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+        T.CenterCrop(size),
+        T.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],
+            std=[0.26862954, 0.26130258, 0.27577711],
+        ),
+    ])
+
+
+class _ClipScoreModel:
+    """Shared CLIP model for text-image alignment scoring (loaded once, kept on GPU)."""
+
+    MODEL_NAME = "openai/clip-vit-large-patch14"
+
+    def __init__(self) -> None:
+        from transformers import CLIPModel, CLIPTokenizerFast
+
+        self._model = (
+            CLIPModel.from_pretrained(self.MODEL_NAME, dtype=torch.bfloat16)
+            .eval()
+            .to("cuda")
+        )
+        self._tokenizer = CLIPTokenizerFast.from_pretrained(self.MODEL_NAME)
+        self._transform = _get_clip_image_transform(self._model.config.vision_config.image_size)
+
+    def compute_score(self, video: Tensor, prompt: str) -> float:
+        """Compute CLIP text-image cosine similarity on the first frame.
+
+        Returns a score rescaled to [1, 4] to match VideoScore range.
+        """
+        # Extract first frame: video is [C, F, H, W] -> [C, H, W]
+        frame = video[:, 0, :, :]
+
+        # Apply CLIP image transform (expects [C, H, W] float in [0, 1])
+        pixel_values = self._transform(frame).unsqueeze(0).to(self._model.device, dtype=self._model.dtype)
+
+        # Tokenize text
+        text_inputs = self._tokenizer(prompt, return_tensors="pt", truncation=True, max_length=77)
+        input_ids = text_inputs["input_ids"].to(self._model.device)
+        attention_mask = text_inputs["attention_mask"].to(self._model.device)
+
+        with torch.inference_mode():
+            image_embeds = self._model.get_image_features(pixel_values=pixel_values)
+            text_embeds = self._model.get_text_features(input_ids=input_ids, attention_mask=attention_mask)
+
+        # L2 normalize and compute cosine similarity
+        image_embeds = nn.functional.normalize(image_embeds, dim=-1)
+        text_embeds = nn.functional.normalize(text_embeds, dim=-1)
+        sim = (image_embeds * text_embeds).sum(dim=-1).item()
+
+        # Rescale from ~[0.15, 0.40] to [1, 4]
+        score = float(np.clip((sim - 0.15) / 0.25, 0.0, 1.0)) * 3.0 + 1.0
+        return score
+
+
+class ClipScoreReward(RewardFunction):
+    """CLIP text-image alignment reward on the first frame of the video."""
+
+    def __init__(self, model: _ClipScoreModel) -> None:
+        self._model = model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        return self._model.compute_score(video, prompt)
+
+
 class VideoScoreDimensionReward(RewardFunction):
     """Single dimension of VideoScore-v1.1."""
 
@@ -338,6 +405,7 @@ class VideoScoreDimensionReward(RewardFunction):
 
 
 _video_score_model: _VideoScoreModel | None = None
+_clip_score_model: _ClipScoreModel | None = None
 
 
 def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
@@ -364,6 +432,12 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
             result.append((reward, f"videoscore_{dim_name}"))
         return result
 
+    if name == "clip_score":
+        global _clip_score_model
+        if _clip_score_model is None:
+            _clip_score_model = _ClipScoreModel()
+        return [(ClipScoreReward(_clip_score_model), "clip_score")]
+
     reward_classes: dict[str, type[RewardFunction]] = {
         "redness": RednessReward,
         "blueness": BluenessReward,
@@ -377,7 +451,7 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
     }
 
     if name not in reward_classes:
-        available = list(reward_classes.keys()) + ["video_score"]
+        available = list(reward_classes.keys()) + ["video_score", "clip_score"]
         raise ValueError(f"Unknown reward function: {name}. Available: {available}")
 
     return [(reward_classes[name](), name)]

@@ -6,10 +6,19 @@ with a reward function, and uses the NFT loss formulation to update LoRA weights
 DDP strategy: With K=16 on 8 GPUs, each GPU generates K/num_gpus samples sequentially.
 Rewards are all-gathered so each GPU sees all K rewards for advantage normalization.
 Each GPU trains on its own generated samples.
+
+Training loop structure (matching reference DiffusionNFT):
+  for epoch in itertools.count():
+      # SAMPLING: generate K videos for each of num_prompts_per_epoch prompts
+      # ADVANTAGES: per-prompt mean, global std
+      # TRAINING: shuffle samples, per-sample timestep permutations, gradient accumulation
+      # OLD UPDATE: once per epoch
 """
 
+import itertools
 import logging
 import os
+import random
 import subprocess
 import sys
 import time
@@ -38,6 +47,7 @@ from ltx_trainer.model_loader import load_text_encoder
 from ltx_trainer.validation_sampler import CachedPromptEmbeddings
 from ltx_trainer.video_utils import save_video
 
+from .ema import EMAWrapper
 from .embedding_store import LazyEmbeddingStore
 from .generation import generate_video_latent
 from .nft_loss import compute_nft_loss
@@ -95,8 +105,20 @@ class RLTrainer:
         # File logging into output dir
         self._setup_log_file()
 
+        # EMA and trainable params (initialized in train())
+        self._ema: EMAWrapper | None = None
+        self._trainable_params: list[Tensor] | None = None
+
     def train(self) -> None:
-        """Run the full RL training loop."""
+        """Run the full RL training loop (epoch-based, matching reference DiffusionNFT).
+
+        Structure per epoch:
+          1. SAMPLING: Generate K videos for each of num_prompts_per_epoch prompts
+          2. ADVANTAGES: Per-prompt mean, global std normalization
+          3. TRAINING: Shuffle samples, per-sample timestep permutations,
+             gradient accumulation across micro-batches x timesteps
+          4. OLD UPDATE: Once per epoch
+        """
         cfg = self._config
         rl_cfg = self._rl_config
         device = self._accelerator.device
@@ -129,11 +151,18 @@ class RLTrainer:
         )
         optimizer = self._accelerator.prepare(optimizer)
 
+        # EMA for trainable parameters
+        ema = EMAWrapper(trainable_params, decay=rl_cfg.ema_decay)
+        self._ema = ema
+        self._trainable_params = trainable_params
+
         Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
         self._save_config()
 
         num_prompts = len(self._cached_prompt_embeddings)
         num_steps = cfg.optimization.steps
+        num_prompts_per_epoch = rl_cfg.num_prompts_per_epoch
+        grad_accum_steps = rl_cfg.gradient_accumulation_steps
 
         assert rl_cfg.num_timesteps_per_sample <= rl_cfg.generation_steps, (
             f"num_timesteps_per_sample ({rl_cfg.num_timesteps_per_sample}) must be "
@@ -144,7 +173,10 @@ class RLTrainer:
             f"Starting RL training: {num_steps} optimizer steps, "
             f"{num_prompts} prompts, K={rl_cfg.num_samples_per_prompt} "
             f"({samples_per_gpu} per GPU), "
-            f"T={rl_cfg.num_timesteps_per_sample} timesteps/sample"
+            f"T={rl_cfg.num_timesteps_per_sample} timesteps/sample, "
+            f"prompts/epoch={num_prompts_per_epoch}, "
+            f"grad_accum={grad_accum_steps}, "
+            f"ema_decay={rl_cfg.ema_decay}"
         )
 
         # Save validation videos at step 0 (before any training)
@@ -153,102 +185,166 @@ class RLTrainer:
 
         self._accelerator.wait_for_everyone()
 
-        for step in range(num_steps):
-            step_start = self._cuda_time()
+        autocast_dtype = torch.bfloat16
+        device_type = str(device).split(":")[0]
+
+        global_step = 0
+        prompt_cycle_idx = 0  # Cycles through all prompts
+
+        for epoch in itertools.count():
+            epoch_start = self._cuda_time()
             timings: dict[str, float] = {}
 
-            # Pick prompt (cycle through)
-            prompt_idx = step % num_prompts
-            cached = self._cached_prompt_embeddings[prompt_idx]
-            video_prompt_embeds = cached.video_context_positive.to(device)
-
             # ============================================================
-            # Phase 1: GENERATE all sub-samples for this GPU (batched)
+            # Phase 1: SAMPLING -- generate K videos for each prompt in epoch
             # ============================================================
             self._transformer.eval()
             self._set_adapter("old")
 
-            local_latents = []
-            local_positions = []
-            local_rewards = []
-            local_individual_rewards = []
+            # epoch_samples[i] = dict with keys: latents, positions, rewards,
+            #   individual_rewards, prompt_embeds, prompt_idx, gen_sigmas
+            epoch_samples: list[dict] = []
 
-            t0 = self._wall_time()
-
-            # Generate all samples in one batched forward pass
-            gen_seeds = [
-                step * num_processes * samples_per_gpu + rank * samples_per_gpu + k
-                for k in range(samples_per_gpu)
-            ]
-
-            t_gen = self._wall_time()
-            all_latents, all_positions, gen_sigmas = generate_video_latent(
-                transformer=self._transformer,
-                video_prompt_embeds=video_prompt_embeds,
-                num_frames=rl_cfg.generation_num_frames,
-                height=rl_cfg.generation_height,
-                width=rl_cfg.generation_width,
-                num_steps=rl_cfg.generation_steps,
-                frame_rate=rl_cfg.frame_rate,
-                seed=gen_seeds,
-                device=device,
-            )
-            total_gen_time = self._wall_time() - t_gen
-
-            # Decode and score each sample individually
+            total_gen_time = 0.0
             total_decode_time = 0.0
             total_reward_time = 0.0
 
-            for k in range(samples_per_gpu):
-                latent = all_latents[k : k + 1]      # [1, seq_len, 128]
-                positions = all_positions[k : k + 1]  # [1, 3, seq_len, 2]
+            for p_idx in range(num_prompts_per_epoch):
+                prompt_idx = prompt_cycle_idx % num_prompts
+                prompt_cycle_idx += 1
+                cached = self._cached_prompt_embeddings[prompt_idx]
+                video_prompt_embeds = cached.video_context_positive.to(device)
 
-                t_dec = self._wall_time()
-                pixel_video = self._decode_latent_to_pixels(latent, device) # [C, F, H, W]
-                total_decode_time += self._wall_time() - t_dec
+                gen_seed_base = (
+                    epoch * num_prompts_per_epoch * num_processes * samples_per_gpu
+                    + p_idx * num_processes * samples_per_gpu
+                    + rank * samples_per_gpu
+                )
+                gen_seeds = [gen_seed_base + k for k in range(samples_per_gpu)]
 
-                t_rew = self._wall_time()
-                prompt_text = cached.prompt_text
-                individual = {name: fn.compute(pixel_video, prompt=prompt_text) for fn, name in self._reward_fns}
-                reward = sum(individual.values())
-                total_reward_time += self._wall_time() - t_rew
+                t0 = self._wall_time()
+                all_latents, all_positions, gen_sigmas = generate_video_latent(
+                    transformer=self._transformer,
+                    video_prompt_embeds=video_prompt_embeds,
+                    num_frames=rl_cfg.generation_num_frames,
+                    height=rl_cfg.generation_height,
+                    width=rl_cfg.generation_width,
+                    num_steps=rl_cfg.generation_steps,
+                    frame_rate=rl_cfg.frame_rate,
+                    seed=gen_seeds,
+                    device=device,
+                )
+                total_gen_time += self._wall_time() - t0
 
-                local_latents.append(latent)
-                local_positions.append(positions)
-                local_rewards.append(reward)
-                local_individual_rewards.append(individual)
+                local_latents = []
+                local_positions = []
+                local_rewards = []
+                local_individual_rewards = []
 
-                del pixel_video
+                # --- Batched VAE decode (all samples in one call) ---
+                t0 = self._wall_time()
+                latent_frames = rl_cfg.generation_num_frames // VIDEO_SCALE_FACTORS.time + 1
+                latent_height = rl_cfg.generation_height // VIDEO_SCALE_FACTORS.height
+                latent_width = rl_cfg.generation_width // VIDEO_SCALE_FACTORS.width
 
-            del all_latents, all_positions
+                unpatchified_list = []
+                for k in range(samples_per_gpu):
+                    unpatchified = self._video_patchifier.unpatchify(
+                        all_latents[k : k + 1],
+                        output_shape=VideoLatentShape(
+                            height=latent_height, width=latent_width,
+                            frames=latent_frames, batch=1, channels=128,
+                        ),
+                    )
+                    unpatchified_list.append(unpatchified)
+
+                unpatchified_batch = torch.cat(unpatchified_list, dim=0).to(device=device, dtype=torch.bfloat16)
+                with torch.no_grad():
+                    decoded_batch = self._vae_decoder(unpatchified_batch)
+                decoded_batch = ((decoded_batch + 1.0) / 2.0).clamp(0.0, 1.0)
+                total_decode_time += self._wall_time() - t0
+                del unpatchified_list, unpatchified_batch
+
+                for k in range(samples_per_gpu):
+                    latent = all_latents[k : k + 1]
+                    positions = all_positions[k : k + 1]
+                    pixel_video = decoded_batch[k].float().cpu()  # [C, F, H, W]
+
+                    t0 = self._wall_time()
+                    prompt_text = cached.prompt_text
+                    individual = {name: fn.compute(pixel_video, prompt=prompt_text) for fn, name in self._reward_fns}
+                    reward = sum(individual.values())
+                    total_reward_time += self._wall_time() - t0
+
+                    local_latents.append(latent)
+                    local_positions.append(positions)
+                    local_rewards.append(reward)
+                    local_individual_rewards.append(individual)
+                    del pixel_video
+                del decoded_batch
+
+                del all_latents, all_positions
+
+                epoch_samples.append({
+                    "latents": local_latents,
+                    "positions": local_positions,
+                    "rewards": local_rewards,
+                    "individual_rewards": local_individual_rewards,
+                    "prompt_embeds": video_prompt_embeds,
+                    "prompt_idx": prompt_idx,
+                    "gen_sigmas": gen_sigmas,
+                })
 
             timings["generation"] = total_gen_time
             timings["decode"] = total_decode_time
             timings["reward"] = total_reward_time
-            timings["phase1_total"] = self._cuda_time() - t0
 
             # ============================================================
-            # Phase 2: GATHER all K rewards across GPUs
+            # Phase 2: GATHER rewards and compute per-prompt advantages
             # ============================================================
             t0 = self._wall_time()
-            local_reward_tensor = torch.tensor(local_rewards, device=device, dtype=torch.float32)
-            all_rewards = self._accelerator.gather(local_reward_tensor)  # [K]
 
-            # Gather per-reward-function breakdowns across GPUs
-            gathered_individual: dict[str, Tensor] = {}
-            for _, name in self._reward_fns:
-                local_vals = torch.tensor(
-                    [d[name] for d in local_individual_rewards], device=device, dtype=torch.float32,
-                )
-                gathered_individual[name] = self._accelerator.gather(local_vals)  # [K]
+            # Gather all rewards across GPUs, organized by prompt
+            all_prompt_rewards: list[Tensor] = []  # [num_prompts_per_epoch] of [K]
+            all_gathered_individual: list[dict[str, Tensor]] = []
+
+            for ps in epoch_samples:
+                local_reward_tensor = torch.tensor(ps["rewards"], device=device, dtype=torch.float32)
+                gathered = self._accelerator.gather(local_reward_tensor)  # [K]
+                all_prompt_rewards.append(gathered)
+
+                gi: dict[str, Tensor] = {}
+                for _, name in self._reward_fns:
+                    local_vals = torch.tensor(
+                        [d[name] for d in ps["individual_rewards"]],
+                        device=device, dtype=torch.float32,
+                    )
+                    gi[name] = self._accelerator.gather(local_vals)  # [K]
+                all_gathered_individual.append(gi)
+
+            # Per-prompt advantages with global std (matching reference)
+            all_flat_rewards = torch.cat(all_prompt_rewards)  # [num_prompts_per_epoch * K]
+            global_std = all_flat_rewards.std().item() + 1e-6
+
+            # Compute per-prompt advantages: (reward - prompt_mean) / global_std
+            # Then clip and map to [0, 1]
+            per_prompt_advantages: list[list[float]] = []
+            for rewards_k in all_prompt_rewards:
+                prompt_mean = rewards_k.mean().item()
+                advs = []
+                for r in rewards_k.tolist():
+                    adv = (r - prompt_mean) / global_std
+                    adv = max(-rl_cfg.adv_clip_max, min(rl_cfg.adv_clip_max, adv))
+                    advs.append(adv / rl_cfg.adv_clip_max / 2.0 + 0.5)
+                per_prompt_advantages.append(advs)
+
             timings["gather"] = self._wall_time() - t0
 
             # ============================================================
-            # Phase 3: TRAIN on each sub-sample (multi-timestep)
-            # Restructured: group by adapter to minimize adapter switches
-            # (3 switches instead of 4*num_timesteps).
+            # Phase 3: TRAINING -- shuffle, per-sample timestep perms, grad accum
             # ============================================================
             self._transformer.train()
+            t_phase3 = self._cuda_time()
 
             total_fwd_new = 0.0
             total_fwd_old = 0.0
@@ -256,182 +352,281 @@ class RLTrainer:
             total_nft_loss = 0.0
             total_backward = 0.0
             total_adapter_switch = 0.0
-            t_phase3 = self._cuda_time()
+            total_opt_step = 0.0
 
-            # Compute advantages for all K samples at once
-            all_advantages = self._compute_advantages(all_rewards, adv_clip_max=rl_cfg.adv_clip_max)
-            # This GPU's advantages are at offset rank*samples_per_gpu
-            local_offset = rank * samples_per_gpu
-
-            # Select random timestep indices from the generation sigma schedule
-            num_timesteps = min(rl_cfg.num_timesteps_per_sample, len(gen_sigmas) - 1)
-            sigma_indices = torch.randperm(len(gen_sigmas) - 1)[:num_timesteps]
-
-            autocast_dtype = torch.bfloat16
-            device_type = str(device).split(":")[0]
-
-            # Total gradient accumulation divisor: we do one backward per
-            # timestep with a batched loss that already averages over
-            # samples_per_gpu, so divide by num_timesteps only.
-            total_grad_accum = num_timesteps
-            backward_pass_count = 0
-
-            accumulated_metrics: dict[str, Tensor] = {}
-
-            # ----------------------------------------------------------
-            # 1. Prepare ALL inputs for ALL timesteps upfront
-            # ----------------------------------------------------------
-            # all_inputs[t_idx] = list of dicts, one per sample
-            all_inputs: list[list[dict]] = []
-            # all_batched_modalities[t_idx] = batched Modality for this timestep
-            all_batched_modalities: list[Modality] = []
-
-            for t_idx in range(num_timesteps):
-                t_val = gen_sigmas[sigma_indices[t_idx]].float()
-                timestep_inputs: list[dict] = []
-                xt_list = []
-                ts_list = []
-                pos_list = []
-
+            # Build flat list of (sample_data_dict) for shuffling
+            flat_samples: list[dict] = []
+            for p_idx, ps in enumerate(epoch_samples):
+                local_offset = rank * samples_per_gpu
                 for k in range(samples_per_gpu):
-                    latent = local_latents[k]
-                    positions = local_positions[k]
-                    r = all_advantages[local_offset + k]
-                    r_tensor = torch.tensor([r], device=device, dtype=torch.float32)
-
-                    seq_len = latent.shape[1]
-                    t_expanded = t_val.view(1, 1, 1)
-
-                    noise = torch.randn_like(latent)
-                    xt = (1 - t_expanded) * latent + t_expanded * noise
-
-                    timesteps = t_val.expand(1, seq_len)
-
-                    timestep_inputs.append({
-                        "latent": latent, "xt": xt, "t_expanded": t_expanded,
-                        "r_tensor": r_tensor,
+                    flat_samples.append({
+                        "latent": ps["latents"][k],
+                        "positions": ps["positions"][k],
+                        "advantage": per_prompt_advantages[p_idx][local_offset + k],
+                        "prompt_embeds": ps["prompt_embeds"],
+                        "gen_sigmas": ps["gen_sigmas"],
                     })
-                    xt_list.append(xt)
-                    ts_list.append(timesteps)
-                    pos_list.append(positions)
 
-                all_inputs.append(timestep_inputs)
+            # Shuffle samples randomly (same seed across GPUs for consistency)
+            shuffle_seed = cfg.seed + epoch
+            rng = random.Random(shuffle_seed)
+            shuffle_order = list(range(len(flat_samples)))
+            rng.shuffle(shuffle_order)
+            flat_samples = [flat_samples[i] for i in shuffle_order]
 
-                # Build batched Modality for this timestep
-                batched_modality = Modality(
+            # Select timestep indices and create per-sample permutations
+            num_timesteps = min(rl_cfg.num_timesteps_per_sample, len(epoch_samples[0]["gen_sigmas"]) - 1)
+            sigma_indices = torch.randperm(len(epoch_samples[0]["gen_sigmas"]) - 1)[:num_timesteps]
+
+            # Per-sample timestep permutations for gradient diversity
+            per_sample_perms = [torch.randperm(num_timesteps) for _ in range(len(flat_samples))]
+
+            # Split into micro-batches (each = samples_per_gpu samples)
+            micro_batch_size = samples_per_gpu
+            micro_batches = [
+                flat_samples[i:i + micro_batch_size]
+                for i in range(0, len(flat_samples), micro_batch_size)
+            ]
+            micro_batch_perms = [
+                per_sample_perms[i:i + micro_batch_size]
+                for i in range(0, len(per_sample_perms), micro_batch_size)
+            ]
+
+            # Effective grad accum = gradient_accumulation_steps x num_timesteps
+            effective_grad_accum = grad_accum_steps * num_timesteps
+            backward_count = 0
+            accumulated_metrics: dict[str, Tensor] = {}
+            accumulated_metrics_snapshot: dict[str, float] = {}
+            epoch_optimizer_steps = 0
+
+            for mb_idx, (mb_samples, mb_perms) in enumerate(zip(micro_batches, micro_batch_perms)):
+                mb_size = len(mb_samples)
+
+                # --- Pre-build ALL modalities and inputs for ALL timesteps ---
+                all_modalities: list[Modality] = []
+                all_input_lists: list[list[dict]] = []
+
+                for j_idx in range(num_timesteps):
+                    xt_list = []
+                    ts_list = []
+                    pos_list = []
+                    input_list: list[dict] = []
+                    ctx_list = []
+
+                    for s_idx in range(mb_size):
+                        sample = mb_samples[s_idx]
+                        perm = mb_perms[s_idx]
+                        actual_sigma_idx = sigma_indices[perm[j_idx]]
+                        t_val = sample["gen_sigmas"][actual_sigma_idx].float()
+
+                        latent = sample["latent"]
+                        positions = sample["positions"]
+                        r_tensor = torch.tensor([sample["advantage"]], device=device, dtype=torch.float32)
+
+                        seq_len = latent.shape[1]
+                        t_expanded = t_val.view(1, 1, 1)
+
+                        noise = torch.randn_like(latent)
+                        xt = (1 - t_expanded) * latent + t_expanded * noise
+                        timesteps = t_val.expand(1, seq_len)
+
+                        input_list.append({
+                            "latent": latent, "xt": xt,
+                            "t_expanded": t_expanded, "r_tensor": r_tensor,
+                        })
+                        xt_list.append(xt)
+                        ts_list.append(timesteps)
+                        pos_list.append(positions)
+                        ctx_list.append(sample["prompt_embeds"])
+
+                    batched_context = torch.cat(
+                        [c.unsqueeze(0) if c.dim() == 2 else c[:1] for c in ctx_list], dim=0
+                    )
+                    all_modalities.append(Modality(
+                        enabled=True,
+                        latent=torch.cat(xt_list, dim=0),
+                        timesteps=torch.cat(ts_list, dim=0),
+                        positions=torch.cat(pos_list, dim=0),
+                        context=batched_context,
+                        context_mask=None,
+                    ))
+                    all_input_lists.append(input_list)
+
+                # --- Build mega-modality (all timesteps concatenated along batch dim) ---
+                mega_modality = Modality(
                     enabled=True,
-                    latent=torch.cat(xt_list, dim=0),
-                    timesteps=torch.cat(ts_list, dim=0),
-                    positions=torch.cat(pos_list, dim=0),
-                    context=video_prompt_embeds.expand(samples_per_gpu, -1, -1),
+                    latent=torch.cat([m.latent for m in all_modalities], dim=0),
+                    timesteps=torch.cat([m.timesteps for m in all_modalities], dim=0),
+                    positions=torch.cat([m.positions for m in all_modalities], dim=0),
+                    context=torch.cat([m.context for m in all_modalities], dim=0),
                     context_mask=None,
                 )
-                all_batched_modalities.append(batched_modality)
 
-            # ----------------------------------------------------------
-            # 2. ALL fwd_old passes (1 adapter switch, no_grad, batched)
-            # ----------------------------------------------------------
-            t0 = self._wall_time()
-            self._set_adapter("old")
-            total_adapter_switch += self._wall_time() - t0
-
-            v_old_all: list[Tensor] = []  # [num_timesteps] of [samples_per_gpu, seq, C]
-            t0 = self._wall_time()
-            with torch.no_grad(), torch.autocast(device_type=device_type, dtype=autocast_dtype):
-                for t_idx in range(num_timesteps):
-                    v_old_batched, _ = self._transformer(
-                        video=all_batched_modalities[t_idx], audio=None, perturbations=None,
-                    )
-                    v_old_all.append(v_old_batched.detach())
-            total_fwd_old = self._wall_time() - t0
-
-            # ----------------------------------------------------------
-            # 3. ALL fwd_ref passes (disable adapters, no_grad, batched)
-            # ----------------------------------------------------------
-            unwrapped = self._accelerator.unwrap_model(self._transformer)
-            t0 = self._wall_time()
-
-            v_ref_all: list[Tensor] = []  # [num_timesteps] of [samples_per_gpu, seq, C]
-            with unwrapped.disable_adapter():
+                # --- ALL old fwd passes (mega-batched single pass) ---
+                t0 = self._wall_time()
+                self._set_adapter("old")
                 total_adapter_switch += self._wall_time() - t0
+
                 t0 = self._wall_time()
                 with torch.no_grad(), torch.autocast(device_type=device_type, dtype=autocast_dtype):
-                    for t_idx in range(num_timesteps):
-                        v_ref_batched, _ = self._transformer(
-                            video=all_batched_modalities[t_idx], audio=None, perturbations=None,
-                        )
-                        v_ref_all.append(v_ref_batched.detach())
-            total_fwd_ref = self._wall_time() - t0
-
-            # ----------------------------------------------------------
-            # 4. fwd_new + loss + backward (default adapter, with grad)
-            #    One batched fwd + backward per timestep.
-            # ----------------------------------------------------------
-            t0 = self._wall_time()
-            self._set_adapter("default")
-            total_adapter_switch += self._wall_time() - t0
-
-            for t_idx in range(num_timesteps):
-                t0 = self._wall_time()
-                with torch.autocast(device_type=device_type, dtype=autocast_dtype):
-                    v_new_batched, _ = self._transformer(
-                        video=all_batched_modalities[t_idx], audio=None, perturbations=None,
+                    v_old_mega, _ = self._transformer(
+                        video=mega_modality, audio=None, perturbations=None,
                     )
-                total_fwd_new += self._wall_time() - t0
+                    v_old_all = list(v_old_mega.split(mb_size, dim=0))
+                total_fwd_old += self._wall_time() - t0
 
-                # Build batched tensors for NFT loss
-                batched_xt = torch.cat([si["xt"] for si in all_inputs[t_idx]], dim=0)
-                batched_x0 = torch.cat([si["latent"] for si in all_inputs[t_idx]], dim=0)
-                batched_t = torch.cat([si["t_expanded"] for si in all_inputs[t_idx]], dim=0)
-                batched_r = torch.cat([si["r_tensor"] for si in all_inputs[t_idx]], dim=0)
-
+                # --- ALL ref fwd passes (mega-batched single pass) ---
+                unwrapped = self._accelerator.unwrap_model(self._transformer)
                 t0 = self._wall_time()
-                loss, metrics = compute_nft_loss(
-                    xt=batched_xt,
-                    x0=batched_x0,
-                    t=batched_t,
-                    forward_pred=v_new_batched,
-                    old_pred=v_old_all[t_idx].detach(),
-                    ref_pred=v_ref_all[t_idx].detach(),
-                    r=batched_r,
-                    beta=rl_cfg.nft_beta,
-                    kl_beta=rl_cfg.kl_beta,
-                    adv_clip_max=rl_cfg.adv_clip_max,
-                )
-                loss = loss / total_grad_accum
-                total_nft_loss += self._wall_time() - t0
+                with unwrapped.disable_adapter():
+                    total_adapter_switch += self._wall_time() - t0
+                    t0 = self._wall_time()
+                    with torch.no_grad(), torch.autocast(device_type=device_type, dtype=autocast_dtype):
+                        v_ref_mega, _ = self._transformer(
+                            video=mega_modality, audio=None, perturbations=None,
+                        )
+                        v_ref_all = list(v_ref_mega.split(mb_size, dim=0))
+                total_fwd_ref += self._wall_time() - t0
 
-                # Accumulate metrics as tensors (no .item() yet)
-                for mkey, mval in metrics.items():
-                    if mkey not in accumulated_metrics:
-                        accumulated_metrics[mkey] = mval / total_grad_accum
+                # --- New fwd + backward per timestep group (single adapter switch) ---
+                t0 = self._wall_time()
+                self._set_adapter("default")
+                total_adapter_switch += self._wall_time() - t0
+
+                new_group = rl_cfg.new_fwd_group_size
+                for group_start in range(0, num_timesteps, new_group):
+                    group_end = min(group_start + new_group, num_timesteps)
+                    group_indices = list(range(group_start, group_end))
+                    group_size = len(group_indices)
+
+                    # --- Grouped forward pass ---
+                    t0 = self._wall_time()
+                    if group_size == 1:
+                        # Single timestep: use modality directly (no cat/split overhead)
+                        with torch.autocast(device_type=device_type, dtype=autocast_dtype):
+                            v_new_batched, _ = self._transformer(
+                                video=all_modalities[group_indices[0]], audio=None, perturbations=None,
+                            )
+                        v_new_chunks = [v_new_batched]
                     else:
-                        accumulated_metrics[mkey] = accumulated_metrics[mkey] + mval / total_grad_accum
+                        # Multiple timesteps: cat modalities, single forward, split output
+                        group_modality = Modality(
+                            enabled=True,
+                            latent=torch.cat([all_modalities[j].latent for j in group_indices], dim=0),
+                            timesteps=torch.cat([all_modalities[j].timesteps for j in group_indices], dim=0),
+                            positions=torch.cat([all_modalities[j].positions for j in group_indices], dim=0),
+                            context=torch.cat([all_modalities[j].context for j in group_indices], dim=0),
+                            context_mask=None,
+                        )
+                        with torch.autocast(device_type=device_type, dtype=autocast_dtype):
+                            v_new_mega, _ = self._transformer(
+                                video=group_modality, audio=None, perturbations=None,
+                            )
+                        v_new_chunks = list(v_new_mega.split(mb_size, dim=0))
+                        del v_new_mega, group_modality
+                    total_fwd_new += self._wall_time() - t0
 
+                    # --- NFT loss for each timestep in group ---
+                    t0 = self._wall_time()
+                    group_loss = torch.tensor(0.0, device=device)
+                    for k, j_idx in enumerate(group_indices):
+                        input_list = all_input_lists[j_idx]
+                        batched_xt = torch.cat([si["xt"] for si in input_list], dim=0)
+                        batched_x0 = torch.cat([si["latent"] for si in input_list], dim=0)
+                        batched_t = torch.cat([si["t_expanded"] for si in input_list], dim=0)
+                        batched_r = torch.cat([si["r_tensor"] for si in input_list], dim=0)
+
+                        loss, metrics = compute_nft_loss(
+                            xt=batched_xt, x0=batched_x0, t=batched_t,
+                            forward_pred=v_new_chunks[k],
+                            old_pred=v_old_all[j_idx].detach(),
+                            ref_pred=v_ref_all[j_idx].detach(),
+                            r=batched_r,
+                            beta=rl_cfg.nft_beta,
+                            kl_beta=rl_cfg.kl_beta,
+                            adv_clip_max=rl_cfg.adv_clip_max,
+                        )
+                        group_loss = group_loss + loss / effective_grad_accum
+
+                        for mkey, mval in metrics.items():
+                            if mkey not in accumulated_metrics:
+                                accumulated_metrics[mkey] = mval / effective_grad_accum
+                            else:
+                                accumulated_metrics[mkey] = accumulated_metrics[mkey] + mval / effective_grad_accum
+                    total_nft_loss += self._wall_time() - t0
+
+                    # --- Backward (no_sync for non-final passes) ---
+                    t0 = self._wall_time()
+                    backward_count += group_size
+                    if backward_count % effective_grad_accum != 0:
+                        with self._accelerator.no_sync(self._transformer):
+                            self._accelerator.backward(group_loss)
+                    else:
+                        self._accelerator.backward(group_loss)
+                    total_backward += self._wall_time() - t0
+
+                    del v_new_chunks
+
+                    # --- Optimizer step at accumulation boundary ---
+                    if backward_count % effective_grad_accum == 0:
+                        t0 = self._wall_time()
+                        if cfg.optimization.max_grad_norm > 0:
+                            self._accelerator.clip_grad_norm_(trainable_params, cfg.optimization.max_grad_norm)
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        total_opt_step += self._wall_time() - t0
+
+                        global_step += 1
+                        epoch_optimizer_steps += 1
+                        ema.step(trainable_params, global_step)
+
+                        # Snapshot metrics for logging
+                        accumulated_metrics_snapshot = {k: v.item() for k, v in accumulated_metrics.items()}
+                        accumulated_metrics = {}
+
+                        # Eval/checkpoint at optimizer step boundaries
+                        if rl_cfg.video_save_interval is not None and self._validation_prompts and global_step % rl_cfg.video_save_interval == 0:
+                            self._save_validation_videos(step=global_step)
+                            if rl_cfg.validation_grid_interval and global_step % rl_cfg.validation_grid_interval == 0:
+                                self._generate_validation_grid(global_step)
+                            self._transformer.train()
+                            self._set_adapter("default")
+
+                        if rl_cfg.checkpoint_save_interval and global_step % rl_cfg.checkpoint_save_interval == 0:
+                            self._save_checkpoint(global_step)
+                            self._set_adapter("default")
+
+                        if global_step >= num_steps:
+                            break
+
+                del v_old_all, v_ref_all, mega_modality, all_modalities, all_input_lists
+
+                if global_step >= num_steps:
+                    break
+
+            # Flush any remaining gradients (if backward_count not aligned)
+            remaining = backward_count % effective_grad_accum
+            if remaining > 0 and global_step < num_steps:
                 t0 = self._wall_time()
-                backward_pass_count += 1
-                if backward_pass_count < total_grad_accum:
-                    with self._accelerator.no_sync(self._transformer):
-                        self._accelerator.backward(loss)
-                else:
-                    # DDP sync on the very last backward pass
-                    self._accelerator.backward(loss)
-                total_backward += self._wall_time() - t0
+                if cfg.optimization.max_grad_norm > 0:
+                    self._accelerator.clip_grad_norm_(trainable_params, cfg.optimization.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad()
+                total_opt_step += self._wall_time() - t0
 
-                del v_new_batched
+                global_step += 1
+                epoch_optimizer_steps += 1
+                ema.step(trainable_params, global_step)
+                accumulated_metrics_snapshot = {k: v.item() for k, v in accumulated_metrics.items()}
+                accumulated_metrics = {}
 
-            del v_old_all, v_ref_all, all_batched_modalities, all_inputs
-
-            # Convert accumulated tensor metrics to floats
-            accumulated_metrics = {k: v.item() for k, v in accumulated_metrics.items()}
-
-            # Optimizer step
+            # ============================================================
+            # Phase 4: DECAY old adapter (once per epoch)
+            # ============================================================
             t0 = self._wall_time()
-            if cfg.optimization.max_grad_norm > 0:
-                self._accelerator.clip_grad_norm_(trainable_params, cfg.optimization.max_grad_norm)
-            optimizer.step()
-            optimizer.zero_grad()
-            total_opt_step = self._wall_time() - t0
+            decay_value = min(global_step * rl_cfg.decay_rate, rl_cfg.max_decay)
+            self._decay_old_adapter(decay_value)
+            timings["decay"] = self._wall_time() - t0
 
             timings["adapter_switch"] = total_adapter_switch
             timings["fwd_new"] = total_fwd_new
@@ -442,52 +637,50 @@ class RLTrainer:
             timings["opt_step"] = total_opt_step
             timings["phase3_total"] = self._cuda_time() - t_phase3
 
-            del local_latents, local_positions
-
             # ============================================================
-            # 4. DECAY old adapter (every old_update_interval optimizer steps)
+            # Phase 5: LOG (epoch-level summary)
             # ============================================================
-            t0 = self._wall_time()
-            opt_step_num = step + 1
-            decay_value = -1.0
-            if opt_step_num % rl_cfg.old_update_interval == 0:
-                decay_value = min(opt_step_num * rl_cfg.decay_rate, rl_cfg.max_decay)
-                self._decay_old_adapter(decay_value)
-            timings["decay"] = self._wall_time() - t0
-
-            # ============================================================
-            # 5. LOG
-            # ============================================================
-            step_time = self._cuda_time() - step_start
-            timings["step_total"] = step_time
+            epoch_time = self._cuda_time() - epoch_start
+            timings["epoch_total"] = epoch_time
 
             if IS_MAIN_PROCESS:
+                all_rewards = all_flat_rewards
                 mean_reward = all_rewards.mean().item()
                 std_reward = all_rewards.std().item() if len(all_rewards) > 1 else 0.0
                 max_reward = all_rewards.max().item()
                 min_reward = all_rewards.min().item()
 
-                mean_advantage = sum(all_advantages) / len(all_advantages)
+                # Mean advantage across all samples
+                all_advs = [a for advs in per_prompt_advantages for a in advs]
+                mean_advantage = sum(all_advs) / len(all_advs)
+
                 log_metrics = {
-                    "rl/loss": accumulated_metrics["total_loss"],
-                    "rl/policy_loss": accumulated_metrics["policy_loss"],
-                    "rl/kl_loss": accumulated_metrics["kl_loss"],
-                    "rl/pos_loss": accumulated_metrics["pos_loss"],
-                    "rl/neg_loss": accumulated_metrics["neg_loss"],
                     "rl/mean_reward": mean_reward,
                     "rl/reward_std": std_reward,
                     "rl/max_reward": max_reward,
                     "rl/min_reward": min_reward,
                     "rl/mean_advantage": mean_advantage,
                     "rl/decay": decay_value,
-                    "rl/step_time": step_time,
+                    "rl/epoch_time": epoch_time,
+                    "rl/epoch": epoch,
+                    "rl/global_step": global_step,
+                    "rl/optimizer_steps_this_epoch": epoch_optimizer_steps,
                     "rl/num_timesteps_per_sample": num_timesteps,
+                    "rl/ema_decay": ema.get_current_decay(global_step),
                 }
-                # Log individual reward means and stds (all K samples)
+                if accumulated_metrics_snapshot:
+                    log_metrics["rl/loss"] = accumulated_metrics_snapshot.get("total_loss", 0.0)
+                    log_metrics["rl/policy_loss"] = accumulated_metrics_snapshot.get("policy_loss", 0.0)
+                    log_metrics["rl/kl_loss"] = accumulated_metrics_snapshot.get("kl_loss", 0.0)
+                    log_metrics["rl/pos_loss"] = accumulated_metrics_snapshot.get("pos_loss", 0.0)
+                    log_metrics["rl/neg_loss"] = accumulated_metrics_snapshot.get("neg_loss", 0.0)
+
+                # Aggregate individual rewards across all prompts in epoch
                 for _, name in self._reward_fns:
-                    log_metrics[f"rl/reward/{name}"] = gathered_individual[name].mean().item()
-                    log_metrics[f"rl/reward/{name}_std"] = gathered_individual[name].std().item() if len(gathered_individual[name]) > 1 else 0.0
-                # Log all timings to W&B
+                    all_vals = torch.cat([gi[name] for gi in all_gathered_individual])
+                    log_metrics[f"rl/reward/{name}"] = all_vals.mean().item()
+                    log_metrics[f"rl/reward/{name}_std"] = all_vals.std().item() if len(all_vals) > 1 else 0.0
+
                 for tname, tval in timings.items():
                     log_metrics[f"rl/time/{tname}"] = tval
                 self._log_metrics(log_metrics)
@@ -495,47 +688,55 @@ class RLTrainer:
                 # Build per-reward detail string
                 reward_parts = []
                 for _, name in self._reward_fns:
-                    r_mean = gathered_individual[name].mean().item()
-                    r_std = gathered_individual[name].std().item() if len(gathered_individual[name]) > 1 else 0.0
-                    reward_parts.append(f"{name}: \u03bc={r_mean:.2f} \u03c3={r_std:.2f}")
+                    all_vals = torch.cat([gi[name] for gi in all_gathered_individual])
+                    r_mean = all_vals.mean().item()
+                    r_std = all_vals.std().item() if len(all_vals) > 1 else 0.0
+                    reward_parts.append(f"{name}: mu={r_mean:.2f} s={r_std:.2f}")
                 reward_detail = " | ".join(reward_parts)
 
-                kl_raw = accumulated_metrics["kl_loss"]
-                kl_weighted = rl_cfg.kl_beta * kl_raw
+                loss_str = ""
+                if accumulated_metrics_snapshot:
+                    kl_raw = accumulated_metrics_snapshot.get("kl_loss", 0.0)
+                    kl_weighted = rl_cfg.kl_beta * kl_raw
+                    loss_str = (
+                        f"loss={accumulated_metrics_snapshot.get('total_loss', 0.0):.3f} "
+                        f"(pol={accumulated_metrics_snapshot.get('policy_loss', 0.0):.1f} "
+                        f"kl={kl_raw:.2f}x{rl_cfg.kl_beta}={kl_weighted:.3f}) | "
+                    )
 
                 gen_time = timings.get("generation", 0.0)
                 rew_time = timings.get("decode", 0.0) + timings.get("reward", 0.0)
                 train_time = timings.get("phase3_total", 0.0)
 
                 logger.info(
-                    f"Step {step + 1}/{num_steps} | "
-                    f"loss={accumulated_metrics['total_loss']:.3f} "
-                    f"(pol={accumulated_metrics['policy_loss']:.1f} "
-                    f"kl={kl_raw:.2f}\u00d7{rl_cfg.kl_beta}={kl_weighted:.3f}) | "
-                    f"reward: \u03bc={mean_reward:.2f} \u03c3={std_reward:.2f} [{min_reward:.2f}, {max_reward:.2f}] | "
+                    f"Step {global_step}/{num_steps} (epoch {epoch}, {num_prompts_per_epoch}p) | "
+                    f"{loss_str}"
+                    f"reward: mu={mean_reward:.2f} s={std_reward:.2f} [{min_reward:.2f}, {max_reward:.2f}] | "
                     f"{reward_detail} | "
                     f"adv={mean_advantage:.3f} | "
-                    f"{step_time:.1f}s (gen={gen_time:.1f} rew={rew_time:.1f} train={train_time:.1f})"
+                    f"{epoch_time:.1f}s (gen={gen_time:.1f} rew={rew_time:.1f} train={train_time:.1f})"
                 )
 
-            # Save validation videos periodically
-            if rl_cfg.video_save_interval is not None and self._validation_prompts and (step + 1) % rl_cfg.video_save_interval == 0:
-                self._save_validation_videos(step=step + 1)
-                if rl_cfg.validation_grid_interval and (step + 1) % rl_cfg.validation_grid_interval == 0:
-                    self._generate_validation_grid(step + 1)
-
-            # Save checkpoint
-            if rl_cfg.checkpoint_save_interval and (step + 1) % rl_cfg.checkpoint_save_interval == 0:
-                self._save_checkpoint(step + 1)
+            # Check eval/checkpoint for steps from the flush path
+            if remaining > 0 and global_step <= num_steps:
+                if rl_cfg.video_save_interval is not None and self._validation_prompts and global_step % rl_cfg.video_save_interval == 0:
+                    self._save_validation_videos(step=global_step)
+                    if rl_cfg.validation_grid_interval and global_step % rl_cfg.validation_grid_interval == 0:
+                        self._generate_validation_grid(global_step)
+                if rl_cfg.checkpoint_save_interval and global_step % rl_cfg.checkpoint_save_interval == 0:
+                    self._save_checkpoint(global_step)
 
             self._accelerator.wait_for_everyone()
 
+            if global_step >= num_steps:
+                break
+
         # Final validation videos + grid + checkpoint
         if rl_cfg.video_save_interval is not None and self._validation_prompts:
-            self._save_validation_videos(step=num_steps)
+            self._save_validation_videos(step=global_step)
             if rl_cfg.validation_grid_interval:
-                self._generate_validation_grid(num_steps)
-        self._save_checkpoint(num_steps)
+                self._generate_validation_grid(global_step)
+        self._save_checkpoint(global_step)
 
         if IS_MAIN_PROCESS and self._wandb_run is not None:
             self._wandb_run.finish()
@@ -718,7 +919,7 @@ class RLTrainer:
             base_transformer = self._transformer.get_base_model()
             base_transformer.set_gradient_checkpointing(True)
 
-        # Keep VAE on GPU — ~250MB in bf16, plenty of headroom on 80GB H100s
+        # Keep VAE on GPU -- ~250MB in bf16, plenty of headroom on 80GB H100s
         self._vae_decoder = self._vae_decoder.to(self._accelerator.device)
 
         # Prepare transformer with accelerator
@@ -852,8 +1053,9 @@ class RLTrainer:
     # ========================================================================
 
     def _save_validation_videos(self, step: int) -> None:
-        """Generate and save one validation video per GPU using the old adapter.
+        """Generate and save one validation video per GPU using EMA weights.
 
+        Swaps EMA weights into the default adapter for generation, then restores.
         Each GPU generates its rank-th validation prompt with a fixed seed,
         producing files like `samples/step_00000_dog.mp4`.
         """
@@ -865,7 +1067,12 @@ class RLTrainer:
         video_prompt_embeds = vp.embeddings.video_context_positive.to(device)
 
         self._transformer.eval()
-        self._set_adapter("old")
+
+        # Use EMA weights for validation if available
+        if self._ema is not None and self._trainable_params is not None:
+            self._ema.copy_ema_to(self._trainable_params)
+
+        self._set_adapter("default")
 
         latent, _, _ = generate_video_latent(
             transformer=self._transformer,
@@ -879,6 +1086,10 @@ class RLTrainer:
             device=device,
         )
         pixel_video = self._decode_latent_to_pixels(latent, device)
+
+        # Restore original weights
+        if self._ema is not None and self._trainable_params is not None:
+            self._ema.restore(self._trainable_params)
 
         output_dir = Path(self._config.output_dir) / "samples"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -916,33 +1127,39 @@ class RLTrainer:
             logger.warning(f"Failed to generate validation grid: {e.stderr[:200]}")
 
     def _save_checkpoint(self, step: int) -> None:
-        """Save LoRA checkpoint (old adapter weights)."""
+        """Save LoRA checkpoint using EMA weights."""
         self._accelerator.wait_for_everyone()
 
-        self._set_adapter("old")
-        # Collective op — all processes must call this even if only main saves
+        # Use EMA weights for checkpoint if available
+        if self._ema is not None and self._trainable_params is not None:
+            self._ema.copy_ema_to(self._trainable_params)
+
+        self._set_adapter("default")
+        # Collective op -- all processes must call this even if only main saves
         self._accelerator.get_state_dict(self._transformer)
 
-        if not IS_MAIN_PROCESS:
-            return
+        if IS_MAIN_PROCESS:
+            save_dir = Path(self._config.output_dir) / "checkpoints"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"rl_lora_weights_step_{step:05d}.safetensors"
+            save_path = save_dir / filename
 
-        save_dir = Path(self._config.output_dir) / "checkpoints"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"rl_lora_weights_step_{step:05d}.safetensors"
-        save_path = save_dir / filename
+            save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
 
-        save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
+            unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
+            state_dict = get_peft_model_state_dict(unwrapped, state_dict=None)
 
-        unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
-        state_dict = get_peft_model_state_dict(unwrapped, state_dict=None)
+            # Remove PEFT prefix, add ComfyUI prefix
+            state_dict = {k.replace("base_model.model.", "", 1): v for k, v in state_dict.items()}
+            state_dict = {f"diffusion_model.{k}": v for k, v in state_dict.items()}
+            state_dict = {k: v.to(save_dtype) for k, v in state_dict.items()}
 
-        # Remove PEFT prefix, add ComfyUI prefix
-        state_dict = {k.replace("base_model.model.", "", 1): v for k, v in state_dict.items()}
-        state_dict = {f"diffusion_model.{k}": v for k, v in state_dict.items()}
-        state_dict = {k: v.to(save_dtype) for k, v in state_dict.items()}
+            save_file(state_dict, save_path)
+            logger.info(f"Checkpoint saved: {save_path.relative_to(self._config.output_dir)}")
 
-        save_file(state_dict, save_path)
-        logger.info(f"Checkpoint saved: {save_path.relative_to(self._config.output_dir)}")
+        # Restore original weights
+        if self._ema is not None and self._trainable_params is not None:
+            self._ema.restore(self._trainable_params)
 
     def _save_config(self) -> None:
         """Save training config to output directory."""

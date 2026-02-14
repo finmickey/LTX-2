@@ -1,0 +1,116 @@
+acceleration:
+  load_text_encoder_in_8bit: false
+  mixed_precision_mode: bf16
+  quantization: null
+checkpoints:
+  interval: 100
+  keep_last_n: -1
+  precision: bfloat16
+data:
+  num_dataloader_workers: 2
+  preprocessed_data_root: /tmp/unused
+flow_matching:
+  timestep_sampling_mode: shifted_logit_normal
+  timestep_sampling_params: {}
+hub:
+  hub_model_id: null
+  push_to_hub: false
+lora:
+  alpha: 64
+  dropout: 0.0
+  rank: 32
+  target_modules:
+  - to_k
+  - to_q
+  - to_v
+  - to_out.0
+model:
+  load_checkpoint: null
+  model_path: models/ltx-2-19b-dev.safetensors
+  text_encoder_path: models/gemma-3-12b-it-qat-q4_0-unquantized
+  training_mode: lora
+optimization:
+  adam_betas:
+  - 0.9
+  - 0.999
+  adam_epsilon: 1.0e-08
+  adam_weight_decay: 0.0001
+  batch_size: 1
+  enable_gradient_checkpointing: false
+  gradient_accumulation_steps: 1
+  learning_rate: 3.0e-04
+  max_grad_norm: 1.0
+  optimizer_type: adamw
+  scheduler_params: {}
+  scheduler_type: constant
+  steps: 100
+output_dir: outputs/rl_nft_aligned_4prompt_run1
+rl:
+  adv_clip_max: 5.0
+  checkpoint_save_interval: 50
+  decay_rate: 0.001
+  ema_decay: 0.9
+  frame_rate: 25.0
+  generation_height: 256
+  generation_num_frames: 41
+  generation_steps: 20
+  generation_width: 256
+  gradient_accumulation_steps: 4
+  kl_beta: 0.0001
+  max_decay: 0.5
+  nft_beta: 0.1
+  num_prompts_per_epoch: 4
+  num_samples_per_prompt: 16
+  new_fwd_group_size: 1
+  num_timesteps_per_sample: 20
+  old_update_interval: 1
+  precomputed_embeddings_dir: embeddings/rl_1000
+  prompts_file: packages/ltx-trainer/data/rl_prompts_1000.txt
+  rewards:
+  - type: video_score
+  validation_grid_interval: 100
+  validation_prompts_file: packages/ltx-trainer/data/rl_validation_prompts.txt
+  video_save_interval: 25
+seed: 42
+training_strategy:
+  audio_latents_dir: audio_latents
+  first_frame_conditioning_p: 0.0
+  name: text_to_video
+  with_audio: false
+validation:
+  frame_rate: 25.0
+  generate_audio: true
+  guidance_scale: 4.0
+  images: null
+  include_reference_in_output: false
+  inference_steps: 50
+  interval: 100
+  negative_prompt: worst quality, inconsistent motion, blurry, jittery, distorted
+  prompts: []
+  reference_downscale_factor: 1
+  reference_videos: null
+  seed: 42
+  skip_initial_validation: false
+  stg_blocks:
+  - 29
+  stg_mode: stg_av
+  stg_scale: 1.0
+  video_dims:
+  - 960
+  - 544
+  - 97
+  videos_per_prompt: 1
+wandb:
+  enabled: true
+  entity: null
+  log_validation_videos: true
+  project: ltx2-rl-videoscore
+  tags:
+  - ltx2
+  - rl
+  - nft
+  - videoscore
+  - aligned
+  - 4prompt
+  - grad-accum-4
+  - ema-0.9

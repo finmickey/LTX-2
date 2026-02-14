@@ -534,8 +534,8 @@ class RLConfig(ConfigBaseModel):
     )
 
     kl_beta: float = Field(
-        default=0.1,
-        description="KL regularization weight",
+        default=0.0001,
+        description="KL regularization weight. Reference DiffusionNFT uses 0.0001.",
         ge=0,
     )
 
@@ -547,10 +547,43 @@ class RLConfig(ConfigBaseModel):
         gt=0,
     )
 
+    num_prompts_per_epoch: int = Field(
+        default=1,
+        description="Number of different prompts sampled per epoch. "
+        "Each prompt generates K videos. All are trained on before old adapter update. "
+        "Reference uses 48 prompts; default=1 preserves backward compat.",
+        ge=1,
+    )
+
+    gradient_accumulation_steps: int = Field(
+        default=1,
+        description="Micro-batches accumulated before one optimizer step. "
+        "Total effective grad accum = this × num_timesteps_per_sample. "
+        "Set = num_prompts_per_epoch for 1 optimizer step per epoch (reference behavior).",
+        ge=1,
+    )
+
+    ema_decay: float = Field(
+        default=0.9,
+        description="EMA decay rate for trainable parameters. "
+        "Dynamic warmup: effective_decay = min((1+step)/(10+step), ema_decay). "
+        "EMA weights used for validation videos and checkpoint saving. Reference uses 0.9.",
+        gt=0,
+        le=1.0,
+    )
+
     num_timesteps_per_sample: int = Field(
         default=1,
         description="Number of random timesteps per sample per optimizer step. "
         "Higher values give richer gradients at the cost of more forward passes.",
+        ge=1,
+    )
+
+    new_fwd_group_size: int = Field(
+        default=1,
+        description="Number of timesteps to group into a single new-adapter forward pass. "
+        "Higher values reduce kernel launch overhead (batch = mb_size * group_size). "
+        "Must divide num_timesteps_per_sample evenly for best efficiency.",
         ge=1,
     )
 
