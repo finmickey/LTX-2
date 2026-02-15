@@ -628,6 +628,12 @@ class RLConfig(ConfigBaseModel):
         description="Generate a validation grid video every N optimizer steps. None to disable.",
     )
 
+    resume_from_checkpoint: str | Path | None = Field(
+        default=None,
+        description="Path to training state .pt file or checkpoint directory to resume from. "
+        "When set, restores optimizer, EMA, both adapters, and step counters.",
+    )
+
     precomputed_embeddings_dir: str | Path | None = Field(
         default=None,
         description="Directory with pre-computed prompt embeddings (.pt files). "

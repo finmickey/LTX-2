@@ -30,7 +30,7 @@ import wandb
 import yaml
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import set_seed
-from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
+from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
 from safetensors.torch import save_file
 from torch import Tensor
 from torch.optim import AdamW
@@ -156,6 +156,15 @@ class RLTrainer:
         self._ema = ema
         self._trainable_params = trainable_params
 
+        # Resume from checkpoint if configured
+        resume_step = 0
+        resume_epoch = 0
+        resume_prompt_cycle_idx = 0
+        if rl_cfg.resume_from_checkpoint is not None:
+            resume_step, resume_epoch, resume_prompt_cycle_idx = self._load_training_state(
+                rl_cfg.resume_from_checkpoint, optimizer,
+            )
+
         Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
         self._save_config()
 
@@ -179,8 +188,8 @@ class RLTrainer:
             f"ema_decay={rl_cfg.ema_decay}"
         )
 
-        # Save validation videos at step 0 (before any training)
-        if rl_cfg.video_save_interval is not None and self._validation_prompts:
+        # Save validation videos at step 0 (before any training), skip on resume
+        if rl_cfg.video_save_interval is not None and self._validation_prompts and resume_step == 0:
             self._save_validation_videos(step=0)
 
         self._accelerator.wait_for_everyone()
@@ -188,10 +197,10 @@ class RLTrainer:
         autocast_dtype = torch.bfloat16
         device_type = str(device).split(":")[0]
 
-        global_step = 0
-        prompt_cycle_idx = 0  # Cycles through all prompts
+        global_step = resume_step
+        prompt_cycle_idx = resume_prompt_cycle_idx
 
-        for epoch in itertools.count():
+        for epoch in itertools.count(start=resume_epoch + 1 if resume_step > 0 else 0):
             epoch_start = self._cuda_time()
             timings: dict[str, float] = {}
 
@@ -593,7 +602,7 @@ class RLTrainer:
                             self._set_adapter("default")
 
                         if rl_cfg.checkpoint_save_interval and global_step % rl_cfg.checkpoint_save_interval == 0:
-                            self._save_checkpoint(global_step)
+                            self._save_checkpoint(global_step, epoch, prompt_cycle_idx, optimizer)
                             self._set_adapter("default")
 
                         if global_step >= num_steps:
@@ -724,7 +733,7 @@ class RLTrainer:
                     if rl_cfg.validation_grid_interval and global_step % rl_cfg.validation_grid_interval == 0:
                         self._generate_validation_grid(global_step)
                 if rl_cfg.checkpoint_save_interval and global_step % rl_cfg.checkpoint_save_interval == 0:
-                    self._save_checkpoint(global_step)
+                    self._save_checkpoint(global_step, epoch, prompt_cycle_idx, optimizer)
 
             self._accelerator.wait_for_everyone()
 
@@ -736,7 +745,7 @@ class RLTrainer:
             self._save_validation_videos(step=global_step)
             if rl_cfg.validation_grid_interval:
                 self._generate_validation_grid(global_step)
-        self._save_checkpoint(global_step)
+        self._save_checkpoint(global_step, epoch, prompt_cycle_idx, optimizer)
 
         if IS_MAIN_PROCESS and self._wandb_run is not None:
             self._wandb_run.finish()
@@ -1126,8 +1135,14 @@ class RLTrainer:
         except subprocess.CalledProcessError as e:
             logger.warning(f"Failed to generate validation grid: {e.stderr[:200]}")
 
-    def _save_checkpoint(self, step: int) -> None:
-        """Save LoRA checkpoint using EMA weights."""
+    def _save_checkpoint(
+        self,
+        step: int,
+        epoch: int = 0,
+        prompt_cycle_idx: int = 0,
+        optimizer: AdamW | None = None,
+    ) -> None:
+        """Save LoRA checkpoint using EMA weights, plus full training state."""
         self._accelerator.wait_for_everyone()
 
         # Use EMA weights for checkpoint if available
@@ -1160,6 +1175,109 @@ class RLTrainer:
         # Restore original weights
         if self._ema is not None and self._trainable_params is not None:
             self._ema.restore(self._trainable_params)
+
+        # Save full training state for resumability
+        if optimizer is not None:
+            self._save_training_state(step, epoch, prompt_cycle_idx, optimizer)
+
+    def _save_training_state(
+        self,
+        step: int,
+        epoch: int,
+        prompt_cycle_idx: int,
+        optimizer: AdamW,
+    ) -> None:
+        """Save full training state (both adapters, optimizer, EMA, counters).
+
+        Only runs on main process. Saved alongside the .safetensors checkpoint.
+        """
+        if not IS_MAIN_PROCESS:
+            return
+
+        save_dir = Path(self._config.output_dir) / "checkpoints"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        save_path = save_dir / f"rl_training_state_step_{step:05d}.pt"
+
+        unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
+
+        # Extract default adapter weights
+        unwrapped.set_adapter("default")
+        default_state = get_peft_model_state_dict(unwrapped, adapter_name="default")
+        default_state = {k: v.cpu().clone() for k, v in default_state.items()}
+
+        # Extract old adapter weights
+        unwrapped.set_adapter("old")
+        old_state = get_peft_model_state_dict(unwrapped, adapter_name="old")
+        old_state = {k: v.cpu().clone() for k, v in old_state.items()}
+
+        # Restore active adapter
+        unwrapped.set_adapter("default")
+
+        training_state = {
+            "global_step": step,
+            "epoch": epoch,
+            "prompt_cycle_idx": prompt_cycle_idx,
+            "default_adapter": default_state,
+            "old_adapter": old_state,
+            "optimizer": optimizer.state_dict(),
+            "ema": self._ema.state_dict() if self._ema is not None else None,
+        }
+
+        torch.save(training_state, save_path)
+        logger.info(f"Training state saved: {save_path.relative_to(self._config.output_dir)}")
+
+    def _load_training_state(
+        self,
+        checkpoint_path: str | Path,
+        optimizer: AdamW,
+    ) -> tuple[int, int, int]:
+        """Load full training state from checkpoint.
+
+        Must be called after dual LoRA setup, accelerator.prepare(optimizer),
+        and EMA init.
+
+        Args:
+            checkpoint_path: Path to .pt file or checkpoint directory.
+            optimizer: The prepared optimizer to restore state into.
+
+        Returns:
+            Tuple of (global_step, epoch, prompt_cycle_idx).
+        """
+        checkpoint_path = Path(checkpoint_path)
+
+        # If directory, find the latest training state file
+        if checkpoint_path.is_dir():
+            state_files = sorted(checkpoint_path.glob("rl_training_state_step_*.pt"))
+            if not state_files:
+                raise FileNotFoundError(f"No training state files found in {checkpoint_path}")
+            checkpoint_path = state_files[-1]
+
+        logger.info(f"Loading training state from {checkpoint_path}")
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+        unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
+
+        # Restore default adapter
+        set_peft_model_state_dict(unwrapped, state["default_adapter"], adapter_name="default")
+
+        # Restore old adapter
+        set_peft_model_state_dict(unwrapped, state["old_adapter"], adapter_name="old")
+
+        # Restore optimizer state
+        optimizer.load_state_dict(state["optimizer"])
+
+        # Restore EMA state
+        if self._ema is not None and state.get("ema") is not None:
+            self._ema.load_state_dict(state["ema"])
+
+        global_step = state["global_step"]
+        epoch = state["epoch"]
+        prompt_cycle_idx = state["prompt_cycle_idx"]
+
+        logger.info(
+            f"Resumed from step {global_step} (epoch {epoch}, prompt_cycle_idx {prompt_cycle_idx})"
+        )
+        return global_step, epoch, prompt_cycle_idx
 
     def _save_config(self) -> None:
         """Save training config to output directory."""

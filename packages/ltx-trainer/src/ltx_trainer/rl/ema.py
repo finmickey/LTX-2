@@ -45,3 +45,13 @@ class EMAWrapper:
         for temp_p, p in zip(self._temp, parameters):
             p.data.copy_(temp_p)
         self._temp = None
+
+    def state_dict(self) -> dict:
+        """Serialize EMA state for checkpointing."""
+        return {"ema_params": [p.clone() for p in self.ema_params], "decay": self.decay}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore EMA state from checkpoint."""
+        for ema_p, saved_p in zip(self.ema_params, state["ema_params"]):
+            ema_p.data.copy_(saved_p.data)
+        self.decay = state["decay"]
