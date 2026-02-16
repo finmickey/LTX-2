@@ -406,6 +406,8 @@ class VideoScoreDimensionReward(RewardFunction):
 
 _video_score_model: _VideoScoreModel | None = None
 _clip_score_model: _ClipScoreModel | None = None
+_video_score2_model: object | None = None
+_unifiedreward_think_model: object | None = None
 
 
 def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
@@ -438,6 +440,30 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
             _clip_score_model = _ClipScoreModel()
         return [(ClipScoreReward(_clip_score_model), "clip_score")]
 
+    if name == "video_score2":
+        from ltx_trainer.rl.rewards_videoscore2 import _VideoScore2Model, VideoScore2DimensionReward
+
+        global _video_score2_model
+        if _video_score2_model is None:
+            _video_score2_model = _VideoScore2Model()
+        result = []
+        for dim_name in _VideoScore2Model.DIMENSIONS:
+            reward = VideoScore2DimensionReward(_video_score2_model, dim_name)
+            result.append((reward, f"videoscore2_{dim_name}"))
+        return result
+
+    if name == "unifiedreward_think":
+        from ltx_trainer.rl.rewards_unifiedreward import _UnifiedRewardThinkModel, UnifiedRewardThinkDimensionReward
+
+        global _unifiedreward_think_model
+        if _unifiedreward_think_model is None:
+            _unifiedreward_think_model = _UnifiedRewardThinkModel()
+        result = []
+        for dim_name in _UnifiedRewardThinkModel.DIMENSIONS:
+            reward = UnifiedRewardThinkDimensionReward(_unifiedreward_think_model, dim_name)
+            result.append((reward, f"unifiedreward_{dim_name}"))
+        return result
+
     reward_classes: dict[str, type[RewardFunction]] = {
         "redness": RednessReward,
         "blueness": BluenessReward,
@@ -451,7 +477,7 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
     }
 
     if name not in reward_classes:
-        available = list(reward_classes.keys()) + ["video_score", "clip_score"]
+        available = list(reward_classes.keys()) + ["video_score", "clip_score", "video_score2", "unifiedreward_think"]
         raise ValueError(f"Unknown reward function: {name}. Available: {available}")
 
     return [(reward_classes[name](), name)]
