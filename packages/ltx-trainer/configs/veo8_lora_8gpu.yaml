@@ -1,0 +1,85 @@
+model:
+  model_path: "/home/user/LTX-2/models/ltx-2-19b-dev.safetensors"
+  text_encoder_path: "/home/user/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized"
+  training_mode: "lora"
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
+
+training_strategy:
+  name: "text_to_video"
+  first_frame_conditioning_p: 0.0
+  with_audio: false
+  noise_channel_shift: 0.5
+  noise_channel_scale: 0.2
+
+optimization:
+  learning_rate: 0.0001
+  steps: 2000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "constant"
+  scheduler_params: {}
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: null
+  load_text_encoder_in_8bit: false
+
+data:
+  preprocessed_data_root: "/home/user/LTX-2/data_8_veo"
+  num_dataloader_workers: 2
+
+validation:
+  prompts:
+    - "A young woman in a red dress twirls gracefully on an empty rooftop at golden hour, her hair flowing in the wind as the city skyline glows behind her."
+    - "An elderly Japanese man carefully arranges a bonsai tree in a sunlit garden, his weathered hands gently trimming branches with small scissors."
+    - "A man with a realistic golden retriever head wearing a business suit sits at a desk in a corporate office, typing on a laptop and nodding seriously during a video call."
+    - "A large brown bear sitting upright at a wooden table in a cozy cabin, carefully moving chess pieces with its paw while a clock ticks beside the board."
+    - "A tiny astronaut in a full spacesuit riding a bicycle through a field of giant mushrooms on an alien planet, with two moons visible in a purple sky."
+    - "A tabby cat cautiously walking along a narrow stone wall in a Mediterranean village, with whitewashed buildings and bright blue doors visible behind it."
+    - "A goldfish swimming inside a round fishbowl that is floating through outer space, with stars and nebulae visible through the glass, the fish calmly blowing bubbles."
+    - "A time-lapse of a bustling Tokyo street corner at night, with neon signs reflecting on wet pavement, crowds with umbrellas, and taxis streaming past in light trails."
+  negative_prompt: ""
+  video_dims: [768, 512, 121]
+  frame_rate: 25.0
+  seed: 42
+  inference_steps: 20
+  interval: 50
+  videos_per_prompt: 1
+  guidance_scale: 1.0
+  stg_scale: 0.0
+  stg_blocks: null
+  stg_mode: "stg_av"
+  generate_audio: false
+  skip_initial_validation: false
+
+checkpoints:
+  interval: 250
+  keep_last_n: -1
+  precision: "bfloat16"
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+
+wandb:
+  enabled: false
+
+seed: 42
+output_dir: "outputs/veo8_t2v_shift05_scale02_run1"

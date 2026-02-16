@@ -1,0 +1,83 @@
+model:
+  model_path: "/home/user/LTX-2/models/ltx-2-19b-dev.safetensors"
+  text_encoder_path: "/home/user/LTX-2/models/gemma-3-12b-it-qat-q4_0-unquantized"
+  training_mode: "lora"
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
+
+training_strategy:
+  name: "text_to_video"
+  first_frame_conditioning_p: 0.5
+  with_audio: false
+
+optimization:
+  learning_rate: 0.0001
+  steps: 2000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "constant"
+  scheduler_params: {}
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: null
+  load_text_encoder_in_8bit: false
+
+data:
+  preprocessed_data_root: "/home/user/LTX-2"
+  num_dataloader_workers: 2
+
+validation:
+  prompts:
+    - "A cinematic, medium shot of a charismatic man in his late 40s wearing a navy blue polo shirt with a white Veo logo, standing confidently on a rooftop terrace overlooking a sunset cityscape, arms crossed with a warm smile."
+    - "A man in a navy blue polo shirt walks through a crowded outdoor market, picking up fresh fruit and chatting with vendors, with colorful stalls and string lights in the background."
+    - "A close-up of a man in his late 40s with short hair, wearing a navy polo shirt, sitting in a modern coffee shop and speaking directly to the camera with animated hand gestures."
+    - "A wide shot of a busy urban intersection at golden hour, with pedestrians crossing the street, taxis passing by, and neon signs reflecting off wet pavement."
+    - "A man wearing a navy blue polo shirt stands in front of a large digital billboard in a city square, pointing at the screen and smiling, surrounded by curious onlookers."
+    - "A cinematic tracking shot of a man in a navy blue polo shirt jogging along a scenic waterfront boardwalk at sunrise, with seagulls flying overhead and boats in the harbor."
+    - "A medium shot of a man in his late 40s wearing a navy polo shirt, standing in a modern glass office lobby, shaking hands with a colleague while people walk past in the background."
+    - "A slow-motion shot of a man in a navy blue polo shirt catching a football in a sunlit park, laughing as autumn leaves swirl around him."
+  negative_prompt: ""
+  video_dims: [768, 512, 121]
+  frame_rate: 25.0
+  seed: 42
+  inference_steps: 20
+  interval: 50
+  videos_per_prompt: 1
+  guidance_scale: 1.0
+  stg_scale: 0.0
+  stg_blocks: null
+  stg_mode: "stg_av"
+  generate_audio: false
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 250
+  keep_last_n: -1
+  precision: "bfloat16"
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+
+wandb:
+  enabled: false
+
+seed: 42
+output_dir: "outputs/my_lora_8gpu_run2"
