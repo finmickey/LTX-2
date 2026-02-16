@@ -160,6 +160,8 @@ training_strategy:
   first_frame_conditioning_p: 0.1     # Probability of first-frame conditioning
   with_audio: false                   # Enable joint audio-video training
   audio_latents_dir: "audio_latents"  # Directory for audio latents (when with_audio: true)
+  noise_channel_shift: 0.2            # Per-channel noise shift std (0 = disabled)
+  noise_channel_scale: 0.2            # Per-channel noise scale std (0 = disabled)
 ```
 
 #### Video-to-Video Strategy (IC-LoRA)
@@ -169,17 +171,21 @@ training_strategy:
   name: "video_to_video"
   first_frame_conditioning_p: 0.1
   reference_latents_dir: "reference_latents"  # Directory for reference video latents
+  noise_channel_shift: 0.2                    # Per-channel noise shift std (0 = disabled)
+  noise_channel_scale: 0.2                    # Per-channel noise scale std (0 = disabled)
 ```
 
 **Key parameters:**
 
 | Parameter                    | Description                                                      |
 |------------------------------|------------------------------------------------------------------|
-| `name`                       | Strategy type: `"text_to_video"` or `"video_to_video"`           |
-| `first_frame_conditioning_p` | Probability of using first frame as conditioning (0.0-1.0)       |
-| `with_audio`                 | (text_to_video only) Enable joint audio-video training           |
-| `audio_latents_dir`          | (text_to_video only) Directory name for audio latents            |
-| `reference_latents_dir`      | (video_to_video only) Directory name for reference video latents |
+| `name`                       | Strategy type: `"text_to_video"` or `"video_to_video"`                              |
+| `first_frame_conditioning_p` | Probability of using first frame as conditioning (0.0-1.0)                          |
+| `with_audio`                 | (text_to_video only) Enable joint audio-video training                              |
+| `audio_latents_dir`          | (text_to_video only) Directory name for audio latents                               |
+| `reference_latents_dir`      | (video_to_video only) Directory name for reference video latents                    |
+| `noise_channel_shift`        | Std of per-channel random shift added to sampled noise (0 = disabled, default: 0.2) |
+| `noise_channel_scale`        | Std of per-channel log-normal scale applied to noise (0 = disabled, default: 0.2)   |
 
 ### OptimizationConfig
 

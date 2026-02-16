@@ -134,6 +134,9 @@ class TextToVideoStrategy(TrainingStrategy):
         # Sample noise and sigmas
         sigmas = timestep_sampler.sample_for(video_latents)
         video_noise = torch.randn_like(video_latents)
+        video_noise = self._augment_noise(
+            video_noise, self.config.noise_channel_shift, self.config.noise_channel_scale
+        )
 
         # Apply noise: noisy = (1 - sigma) * clean + sigma * noise
         sigmas_expanded = sigmas.view(-1, 1, 1)
@@ -231,6 +234,9 @@ class TextToVideoStrategy(TrainingStrategy):
 
         # Sample audio noise
         audio_noise = torch.randn_like(audio_latents)
+        audio_noise = self._augment_noise(
+            audio_noise, self.config.noise_channel_shift, self.config.noise_channel_scale
+        )
 
         # Apply noise to audio (same sigma as video)
         sigmas_expanded = sigmas.view(-1, 1, 1)

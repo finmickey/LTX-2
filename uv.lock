@@ -340,12 +340,12 @@ name = "bitsandbytes"
 version = "0.49.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-fp8-trtllm'" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra != 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
-    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra != 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
-    { name = "packaging" },
-    { name = "torch", version = "2.7.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-fp8-trtllm'" },
-    { name = "torch", version = "2.9.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-xformers' or extra != 'extra-8-ltx-core-fp8-trtllm'" },
+    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+    { name = "packaging", marker = "sys_platform == 'linux' or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+    { name = "torch", version = "2.7.1", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+    { name = "torch", version = "2.9.1", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/19/6f/32d0526e4e4ad309d9e7502c018399bb23b63f39277a361c305092e2f885/bitsandbytes-0.49.1-py3-none-macosx_14_0_arm64.whl", hash = "sha256:9de01d4384b6c71ef9ab052b98457dc0e4fff8fe06ab14833b5b712700deb005", size = 129848 },
@@ -1059,7 +1059,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371 }
 wheels = [
@@ -1850,7 +1850,7 @@ wheels = [
 
 [[package]]
 name = "ltx-core"
-version = "0.1.0"
+version = "1.0.0"
 source = { editable = "packages/ltx-core" }
 dependencies = [
     { name = "accelerate" },
@@ -1908,7 +1908,7 @@ dev = [{ name = "scikit-image", specifier = ">=0.25.2" }]
 
 [[package]]
 name = "ltx-pipelines"
-version = "0.1.0"
+version = "1.0.0"
 source = { editable = "packages/ltx-pipelines" }
 dependencies = [
     { name = "av" },
@@ -1928,7 +1928,7 @@ requires-dist = [
 
 [[package]]
 name = "ltx-trainer"
-version = "0.1.0"
+version = "1.0.0"
 source = { editable = "packages/ltx-trainer" }
 dependencies = [
     { name = "accelerate" },
@@ -2444,13 +2444,13 @@ name = "mlx-lm"
 version = "0.29.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "jinja2" },
+    { name = "jinja2", marker = "sys_platform == 'darwin'" },
     { name = "mlx", marker = "sys_platform == 'darwin'" },
-    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" } },
-    { name = "protobuf" },
-    { name = "pyyaml" },
-    { name = "sentencepiece" },
-    { name = "transformers", version = "4.53.1", source = { registry = "https://pypi.org/simple" } },
+    { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
+    { name = "protobuf", marker = "sys_platform == 'darwin'" },
+    { name = "pyyaml", marker = "sys_platform == 'darwin'" },
+    { name = "sentencepiece", marker = "sys_platform == 'darwin'" },
+    { name = "transformers", version = "4.53.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/e3/62/f46e1355256a114808517947f8e83ad6be310c7288c551db0fa678f47923/mlx_lm-0.29.1.tar.gz", hash = "sha256:b99180d8f33d33a077b814e550bfb2d8a59ae003d668fd1f4b3fff62a381d34b", size = 232302 }
 wheels = [
@@ -3042,18 +3042,14 @@ source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'darwin'",
     "python_full_version == '3.12.*' and sys_platform == 'darwin'",
-    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
     "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'darwin'",
-    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'linux'",
     "python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux'",
 ]
@@ -3068,9 +3064,16 @@ name = "nvidia-cuda-nvrtc-cu12"
 version = "12.8.93"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and sys_platform == 'linux'",
+    "python_full_version >= '3.12' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version >= '3.12' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/05/6b/32f747947df2da6994e999492ab306a903659555dddc0fbdeb9d71f75e52/nvidia_cuda_nvrtc_cu12-12.8.93-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:a7756528852ef889772a84c6cd89d41dfa74667e24cca16bb31f8f061e3e9994", size = 88040029 },
@@ -3085,18 +3088,14 @@ source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'darwin'",
     "python_full_version == '3.12.*' and sys_platform == 'darwin'",
-    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
     "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'darwin'",
-    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'linux'",
     "python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux'",
 ]
@@ -3113,9 +3112,16 @@ name = "nvidia-cuda-runtime-cu12"
 version = "12.8.90"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and sys_platform == 'linux'",
+    "python_full_version >= '3.12' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version >= '3.12' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7c/75/f865a3b236e4647605ea34cc450900854ba123834a5f1598e160b9530c3a/nvidia_cuda_runtime_cu12-12.8.90-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:52bf7bbee900262ffefe5e9d5a2a69a30d97e2bc5bb6cc866688caa976966e3d", size = 965265 },
@@ -3134,7 +3140,7 @@ resolution-markers = [
     "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-cublas-cu12", version = "12.6.4.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-fp8-trtllm'" },
+    { name = "nvidia-cublas-cu12", version = "12.6.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (platform_machine == 'aarch64' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers') or (sys_platform != 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/99/93/a201a12d3ec1caa8c6ac34c1c2f9eeb696b886f0c36ff23c638b46603bd0/nvidia_cudnn_cu12-9.5.1.17-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:9fd4584468533c61873e5fda8ca41bac3a38bcb2d12350830c69b0a96a7e4def", size = 570523509 },
@@ -3152,7 +3158,7 @@ resolution-markers = [
     "python_full_version < '3.11' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-cublas-cu12", version = "12.8.4.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-xformers' or extra != 'extra-8-ltx-core-fp8-trtllm'" },
+    { name = "nvidia-cublas-cu12", version = "12.8.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fa/41/e79269ce215c857c935fd86bcfe91a451a584dfc27f1e068f568b9ad1ab7/nvidia_cudnn_cu12-9.10.2.21-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:c9132cc3f8958447b4910a1720036d9eff5928cc3179b0a51fb6d167c6cc87d8", size = 705026878 },
@@ -3171,7 +3177,7 @@ resolution-markers = [
     "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", version = "12.6.85", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-fp8-trtllm'" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.6.85", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (platform_machine == 'aarch64' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers') or (sys_platform != 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1f/37/c50d2b2f2c07e146776389e3080f4faf70bcc4fa6e19d65bb54ca174ebc3/nvidia_cufft_cu12-11.3.0.4-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d16079550df460376455cba121db6564089176d9bac9e4f360493ca4741b22a6", size = 200164144 },
@@ -3191,7 +3197,7 @@ resolution-markers = [
     "python_full_version < '3.11' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", version = "12.8.93", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-xformers' or extra != 'extra-8-ltx-core-fp8-trtllm'" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.8.93", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/60/bc/7771846d3a0272026c416fbb7e5f4c1f146d6d80704534d0b187dd6f4800/nvidia_cufft_cu12-11.3.3.83-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:848ef7224d6305cdb2a4df928759dca7b1201874787083b6e7550dd6765ce69a", size = 193109211 },
@@ -3272,9 +3278,9 @@ resolution-markers = [
     "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-cublas-cu12", version = "12.6.4.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-fp8-trtllm'" },
-    { name = "nvidia-cusparse-cu12", version = "12.5.4.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-fp8-trtllm'" },
-    { name = "nvidia-nvjitlink-cu12", version = "12.6.85", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-fp8-trtllm'" },
+    { name = "nvidia-cublas-cu12", version = "12.6.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (platform_machine == 'aarch64' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers') or (sys_platform != 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+    { name = "nvidia-cusparse-cu12", version = "12.5.4.2", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (platform_machine == 'aarch64' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers') or (sys_platform != 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.6.85", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (platform_machine == 'aarch64' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers') or (sys_platform != 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/93/17/dbe1aa865e4fdc7b6d4d0dd308fdd5aaab60f939abfc0ea1954eac4fb113/nvidia_cusolver_cu12-11.7.1.2-py3-none-manylinux2014_aarch64.whl", hash = "sha256:0ce237ef60acde1efc457335a2ddadfd7610b892d94efee7b776c64bb1cac9e0", size = 157833628 },
@@ -3294,9 +3300,9 @@ resolution-markers = [
     "python_full_version < '3.11' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-cublas-cu12", version = "12.8.4.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-xformers' or extra != 'extra-8-ltx-core-fp8-trtllm'" },
-    { name = "nvidia-cusparse-cu12", version = "12.5.8.93", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-xformers' or extra != 'extra-8-ltx-core-fp8-trtllm'" },
-    { name = "nvidia-nvjitlink-cu12", version = "12.8.93", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-xformers' or extra != 'extra-8-ltx-core-fp8-trtllm'" },
+    { name = "nvidia-cublas-cu12", version = "12.8.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+    { name = "nvidia-cusparse-cu12", version = "12.5.8.93", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.8.93", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c8/32/f7cd6ce8a7690544d084ea21c26e910a97e077c9b7f07bf5de623ee19981/nvidia_cusolver_cu12-11.7.3.90-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:db9ed69dbef9715071232caa9b69c52ac7de3a95773c2db65bdba85916e4e5c0", size = 267229841 },
@@ -3315,7 +3321,7 @@ resolution-markers = [
     "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", version = "12.6.85", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-fp8-trtllm'" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.6.85", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (platform_machine == 'aarch64' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers') or (sys_platform != 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/eb/eb/6681efd0aa7df96b4f8067b3ce7246833dd36830bb4cec8896182773db7d/nvidia_cusparse_cu12-12.5.4.2-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d25b62fb18751758fe3c93a4a08eff08effedfe4edf1c6bb5afd0890fe88f887", size = 216451147 },
@@ -3335,7 +3341,7 @@ resolution-markers = [
     "python_full_version < '3.11' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "nvidia-nvjitlink-cu12", version = "12.8.93", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-xformers' or extra != 'extra-8-ltx-core-fp8-trtllm'" },
+    { name = "nvidia-nvjitlink-cu12", version = "12.8.93", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bc/f7/cd777c4109681367721b00a106f491e0d0d15cfa1fd59672ce580ce42a97/nvidia_cusparse_cu12-12.5.8.93-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:9b6c161cb130be1a07a27ea6923df8141f3c295852f4b260c65f18f3e0a091dc", size = 288117129 },
@@ -3430,18 +3436,14 @@ source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.13' and sys_platform == 'darwin'",
     "python_full_version == '3.12.*' and sys_platform == 'darwin'",
-    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
     "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'linux'",
     "python_full_version == '3.11.*' and sys_platform == 'darwin'",
-    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'linux'",
     "python_full_version < '3.11' and sys_platform == 'darwin'",
-    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
     "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux'",
     "python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux'",
 ]
@@ -3455,9 +3457,16 @@ name = "nvidia-nccl-cu12"
 version = "2.27.5"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12' and sys_platform == 'linux'",
-    "python_full_version == '3.11.*' and sys_platform == 'linux'",
-    "python_full_version < '3.11' and sys_platform == 'linux'",
+    "python_full_version >= '3.12' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version >= '3.12' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
+    "python_full_version < '3.11' and sys_platform == 'linux' and extra != 'extra-8-ltx-core-fp8-trtllm' and extra != 'extra-8-ltx-core-xformers'",
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bb/1c/857979db0ef194ca5e21478a0612bcdbbe59458d7694361882279947b349/nvidia_nccl_cu12-2.27.5-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:31432ad4d1fb1004eb0c56203dc9bc2178a1ba69d1d9e02d64a6938ab5e40e7a", size = 322400625 },
@@ -5702,7 +5711,8 @@ name = "tensorrt-cu12-libs"
 version = "10.11.0.33"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "nvidia-cuda-runtime-cu12", version = "12.6.77", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-cuda-runtime-cu12", version = "12.6.77", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and extra == 'extra-8-ltx-core-fp8-trtllm') or (sys_platform != 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+    { name = "nvidia-cuda-runtime-cu12", version = "12.8.90", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (platform_machine != 'aarch64' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers') or (sys_platform != 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6f/89/42292357798be92dc8bc8110350a7295cb8dfa18fcf642be43db78a05316/tensorrt_cu12_libs-10.11.0.33.tar.gz", hash = "sha256:632f912b3a5fbccd317f85d0c0a342c86d58a201e2b65b2c08c179603859e11c", size = 709 }
 
@@ -5737,10 +5747,12 @@ dependencies = [
     { name = "mpmath" },
     { name = "ninja" },
     { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" } },
-    { name = "nvidia-cuda-nvrtc-cu12", version = "12.6.77", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-cuda-nvrtc-cu12", version = "12.6.77", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and extra == 'extra-8-ltx-core-fp8-trtllm') or (sys_platform != 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+    { name = "nvidia-cuda-nvrtc-cu12", version = "12.8.93", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (platform_machine != 'aarch64' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers') or (sys_platform != 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
     { name = "nvidia-ml-py" },
     { name = "nvidia-modelopt", marker = "extra == 'extra-8-ltx-core-fp8-trtllm'" },
-    { name = "nvidia-nccl-cu12", version = "2.26.2", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-nccl-cu12", version = "2.26.2", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and extra == 'extra-8-ltx-core-fp8-trtllm') or (sys_platform != 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+    { name = "nvidia-nccl-cu12", version = "2.27.5", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (platform_machine != 'aarch64' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers') or (sys_platform != 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
     { name = "nvtx" },
     { name = "omegaconf" },
     { name = "onnx", version = "1.19.0", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and extra == 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
@@ -6503,7 +6515,7 @@ resolution-markers = [
     "python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux'",
 ]
 dependencies = [
-    { name = "setuptools", version = "79.0.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-fp8-trtllm'" },
+    { name = "setuptools", version = "79.0.1", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'aarch64' and extra == 'extra-8-ltx-core-fp8-trtllm') or (sys_platform != 'linux' and extra == 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8d/a9/549e51e9b1b2c9b854fd761a1d23df0ba2fbc60bd0c13b489ffa518cfcb7/triton-3.3.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b74db445b1c562844d3cfad6e9679c72e93fdfb1a90a24052b03bb5c49d1242e", size = 155600257 },

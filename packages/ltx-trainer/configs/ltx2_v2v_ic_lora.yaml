@@ -112,6 +112,13 @@ training_strategy:
   # These are the conditioning inputs that guide the transformation
   reference_latents_dir: "reference_latents"
 
+  # Per-channel noise augmentation parameters
+  # These add random per-channel shift and scale to the sampled noise,
+  # making the model more robust by diversifying the noise distribution.
+  # Set to 0.0 to disable each augmentation.
+  noise_channel_shift: 0.2  # Std of per-channel random shift added to noise
+  noise_channel_scale: 0.2  # Std of per-channel log-normal scale applied to noise
+
 # -----------------------------------------------------------------------------
 # Optimization Configuration
 # -----------------------------------------------------------------------------

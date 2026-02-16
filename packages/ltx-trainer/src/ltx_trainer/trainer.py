@@ -7,7 +7,7 @@ from typing import Callable
 import torch
 import wandb
 import yaml
-from accelerate import Accelerator, DistributedType
+from accelerate import Accelerator, DistributedDataParallelKwargs, DistributedType
 from accelerate.utils import set_seed
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
 from peft.tuners.tuners_utils import BaseTunerLayer
@@ -77,6 +77,9 @@ class TrainingStats(BaseModel):
 class LtxvTrainer:
     def __init__(self, trainer_config: LtxTrainerConfig) -> None:
         self._config = trainer_config
+        # Set CUDA device early so model loading uses the correct GPU in DDP
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
@@ -125,6 +128,11 @@ class LtxvTrainer:
         self._save_config()
 
         logger.info("🚀 Starting training...")
+        logger.info(
+            f"Dataset: {len(self._dataset)} samples, "
+            f"Dataloader batches: {len(self._dataloader)}, "
+            f"Total optimization steps: {cfg.optimization.steps}"
+        )
 
         # Create progress tracking (disabled for non-main processes or when explicitly disabled)
         progress_enabled = IS_MAIN_PROCESS and not disable_progress_bars
@@ -146,11 +154,14 @@ class LtxvTrainer:
         with progress:
             # Initial validation before training starts
             if cfg.validation.interval and not cfg.validation.skip_initial_validation:
+                logger.info("Running initial validation (step 0)...")
                 sampled_videos_paths = self._sample_videos(progress)
+                logger.info("Initial validation complete.")
                 if IS_MAIN_PROCESS and sampled_videos_paths and self._config.wandb.log_validation_videos:
                     self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
 
             self._accelerator.wait_for_everyone()
+            logger.info("All processes synchronized. Starting training loop...")
 
             for step in range(cfg.optimization.steps * cfg.optimization.gradient_accumulation_steps):
                 # Get next batch, reset the dataloader if needed
@@ -181,23 +192,16 @@ class LtxvTrainer:
                     if self._lr_scheduler is not None:
                         self._lr_scheduler.step()
 
-                    # Run validation if needed
+                    # Run validation if needed (all processes participate for distributed generation)
                     if (
                         cfg.validation.interval
                         and self._global_step > 0
                         and self._global_step % cfg.validation.interval == 0
                         and is_optimization_step
                     ):
-                        if self._accelerator.distributed_type == DistributedType.FSDP:
-                            # FSDP: All processes must participate in validation
-                            sampled_videos_paths = self._sample_videos(progress)
-                            if IS_MAIN_PROCESS and sampled_videos_paths and self._config.wandb.log_validation_videos:
-                                self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
-                        # DDP: Only main process runs validation
-                        elif IS_MAIN_PROCESS:
-                            sampled_videos_paths = self._sample_videos(progress)
-                            if sampled_videos_paths and self._config.wandb.log_validation_videos:
-                                self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
+                        sampled_videos_paths = self._sample_videos(progress)
+                        if IS_MAIN_PROCESS and sampled_videos_paths and self._config.wandb.log_validation_videos:
+                            self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
 
                     # Save checkpoint if needed
                     if (
@@ -238,8 +242,8 @@ class LtxvTrainer:
                             }
                         )
 
-                    # Fallback logging when progress bars are disabled
-                    if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 20 == 0:
+                    # Periodic logging every 10 steps
+                    if IS_MAIN_PROCESS and is_optimization_step and self._global_step % 10 == 0:
                         elapsed = time.time() - train_start_time
                         progress_percentage = self._global_step / cfg.optimization.steps
                         if progress_percentage > 0:
@@ -684,9 +688,11 @@ class LtxvTrainer:
 
         # All distributed setup (DDP/FSDP, number of processes, etc.) is controlled by
         # the user's Accelerate configuration (accelerate config / accelerate launch).
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         self._accelerator = Accelerator(
             mixed_precision=self._config.acceleration.mixed_precision_mode,
             gradient_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
+            kwargs_handlers=[ddp_kwargs],
         )
 
         if self._accelerator.num_processes > 1:
@@ -723,7 +729,11 @@ class LtxvTrainer:
     @torch.no_grad()
     @free_gpu_memory_context(after=True)
     def _sample_videos(self, progress: TrainingProgress) -> list[Path] | None:
-        """Run validation by generating videos from validation prompts."""
+        """Run validation by generating videos from validation prompts.
+
+        In multi-GPU (DDP) mode, prompts are distributed across all processes so each GPU
+        generates a subset of videos in parallel. All processes must call this method.
+        """
         use_images = self._config.validation.images is not None
         use_reference_videos = self._config.validation.reference_videos is not None
         generate_audio = self._config.validation.generate_audio
@@ -733,15 +743,31 @@ class LtxvTrainer:
         self._optimizer.zero_grad(set_to_none=True)
         free_gpu_memory()
 
+        all_prompts = self._config.validation.prompts
+        num_prompts = len(all_prompts)
+        width, height, num_frames = self._config.validation.video_dims
+
+        # Distribute prompts across processes
+        rank = self._accelerator.process_index
+        world_size = self._accelerator.num_processes
+        my_prompt_indices = [i for i in range(num_prompts) if i % world_size == rank]
+
+        logger.info(
+            f"🎬 Validation: {num_prompts} videos at {width}x{height}x{num_frames}, "
+            f"{inference_steps} steps (step {self._global_step}). "
+            f"Rank {rank} generating {len(my_prompt_indices)} videos: {my_prompt_indices}"
+        )
+
         # Start sampling progress tracking
         sampling_ctx = progress.start_sampling(
-            num_prompts=len(self._config.validation.prompts),
+            num_prompts=len(my_prompt_indices),
             num_steps=inference_steps,
         )
 
-        # Create validation sampler with loaded models and progress tracking
+        # Create validation sampler with unwrapped model to avoid DDP state issues
+        unwrapped_transformer = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
         sampler = ValidationSampler(
-            transformer=self._transformer,
+            transformer=unwrapped_transformer,
             vae_decoder=self._vae_decoder,
             vae_encoder=self._vae_encoder,
             text_encoder=None,
@@ -754,25 +780,23 @@ class LtxvTrainer:
         output_dir.mkdir(exist_ok=True, parents=True)
 
         video_paths = []
-        width, height, num_frames = self._config.validation.video_dims
 
-        for prompt_idx, prompt in enumerate(self._config.validation.prompts):
-            # Update progress to show current video
-            sampling_ctx.start_video(prompt_idx)
+        for local_idx, prompt_idx in enumerate(my_prompt_indices):
+            prompt = all_prompts[prompt_idx]
+            logger.info(f"  [rank {rank}] Generating video {prompt_idx + 1}/{num_prompts}...")
+            sampling_ctx.start_video(local_idx)
 
             # Load conditioning image if provided
             condition_image = None
             if use_images:
                 image_path = self._config.validation.images[prompt_idx]
                 image = open_image_as_srgb(image_path)
-                # Convert PIL image to tensor [C, H, W] in [0, 1]
                 condition_image = F.to_tensor(image)
 
             # Load reference video if provided (for IC-LoRA)
             reference_video = None
             if use_reference_videos:
                 ref_video_path = self._config.validation.reference_videos[prompt_idx]
-                # read_video returns [F, C, H, W] in [0, 1]
                 reference_video, _ = read_video(ref_video_path, max_frames=num_frames)
 
             # Get cached embeddings for this prompt if available
@@ -782,7 +806,6 @@ class LtxvTrainer:
                 else None
             )
 
-            # Create generation config
             gen_config = GenerationConfig(
                 prompt=prompt,
                 negative_prompt=self._config.validation.negative_prompt,
@@ -804,30 +827,42 @@ class LtxvTrainer:
                 stg_mode=self._config.validation.stg_mode,
             )
 
-            # Generate sample
+            gen_start = time.time()
             video, audio = sampler.generate(
                 config=gen_config,
                 device=self._accelerator.device,
             )
+            gen_time = time.time() - gen_start
+            logger.info(f"  [rank {rank}] Video {prompt_idx + 1}/{num_prompts} generated in {gen_time:.1f}s")
 
-            # Save output (image for single frame, video otherwise)
-            if IS_MAIN_PROCESS:
-                ext = "png" if num_frames == 1 else "mp4"
-                output_path = output_dir / f"step_{self._global_step:06d}_{prompt_idx + 1}.{ext}"
-                if num_frames == 1:
-                    save_image(video, output_path)
-                else:
-                    save_video(
-                        video_tensor=video,
-                        output_path=output_path,
-                        fps=self._config.validation.frame_rate,
-                        audio=audio,
-                        audio_sample_rate=self._vocoder.output_sample_rate if audio is not None else None,
-                    )
-                video_paths.append(output_path)
+            # Every process saves its own videos
+            ext = "png" if num_frames == 1 else "mp4"
+            output_path = output_dir / f"step_{self._global_step:06d}_{prompt_idx + 1}.{ext}"
+            if num_frames == 1:
+                save_image(video, output_path)
+            else:
+                save_video(
+                    video_tensor=video,
+                    output_path=output_path,
+                    fps=self._config.validation.frame_rate,
+                    audio=audio,
+                    audio_sample_rate=self._vocoder.output_sample_rate if audio is not None else None,
+                )
+            video_paths.append(output_path)
 
         # Clean up progress tasks
         sampling_ctx.cleanup()
+
+        # Synchronize all processes after validation
+        self._accelerator.wait_for_everyone()
+
+        # On main process, collect all video paths in order
+        if IS_MAIN_PROCESS:
+            all_video_paths = []
+            ext = "png" if num_frames == 1 else "mp4"
+            for i in range(num_prompts):
+                all_video_paths.append(output_dir / f"step_{self._global_step:06d}_{i + 1}.{ext}")
+            video_paths = all_video_paths
 
         rel_outputs_path = output_dir.relative_to(self._config.output_dir)
         logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")

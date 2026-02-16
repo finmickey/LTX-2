@@ -39,6 +39,18 @@ class TrainingStrategyConfigBase(BaseModel):
         description="Unique name identifying the training strategy type"
     )
 
+    noise_channel_shift: float = Field(
+        default=0.2,
+        description="Std of per-channel random shift added to sampled noise (0 = disabled)",
+        ge=0.0,
+    )
+
+    noise_channel_scale: float = Field(
+        default=0.2,
+        description="Std of per-channel log-normal scale applied to sampled noise (0 = disabled)",
+        ge=0.0,
+    )
+
 
 @dataclass
 class ModelInputs:
@@ -73,6 +85,26 @@ class TrainingStrategy(ABC):
         self.config = config
         self._video_patchifier = VideoLatentPatchifier(patch_size=1)
         self._audio_patchifier = AudioPatchifier(patch_size=1)
+
+    @staticmethod
+    def _augment_noise(noise: Tensor, channel_shift: float, channel_scale: float) -> Tensor:
+        """Apply per-channel shift and scale augmentation to sampled noise.
+        Args:
+            noise: Noise tensor of shape [B, seq_len, D]
+            channel_shift: Std of per-channel random shift (0 = disabled)
+            channel_scale: Std of per-channel log-normal scale (0 = disabled)
+        Returns:
+            Augmented noise tensor of the same shape
+        """
+        if channel_shift > 0:
+            B, _, D = noise.shape
+            shift = torch.randn(B, 1, D, device=noise.device, dtype=noise.dtype) * channel_shift
+            noise = noise + shift
+        if channel_scale > 0:
+            B, _, D = noise.shape
+            log_scale = torch.randn(B, 1, D, device=noise.device, dtype=noise.dtype) * channel_scale
+            noise = noise * torch.exp(log_scale)
+        return noise
 
     @property
     def requires_audio(self) -> bool:

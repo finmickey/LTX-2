@@ -155,6 +155,9 @@ class VideoToVideoStrategy(TrainingStrategy):
         # Sample noise and sigmas for target
         sigmas = timestep_sampler.sample_for(target_latents)
         noise = torch.randn_like(target_latents)
+        noise = self._augment_noise(
+            noise, self.config.noise_channel_shift, self.config.noise_channel_scale
+        )
         sigmas_expanded = sigmas.view(-1, 1, 1)
 
         # Apply noise to target
