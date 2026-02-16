@@ -63,18 +63,45 @@ def main(
         default=False,
         help="Load Gemma in 8-bit precision (requires bitsandbytes)",
     ),
+    num_shards: int = typer.Option(
+        default=1,
+        help="Total number of parallel workers (for multi-GPU sharding)",
+    ),
+    shard_index: int = typer.Option(
+        default=0,
+        help="Which shard this worker handles (0-indexed)",
+    ),
 ) -> None:
     """Encode each prompt and save as {idx:06d}.pt."""
     prompts_path = Path(prompts_file)
     if not prompts_path.is_file():
         raise typer.BadParameter(f"Prompts file not found: {prompts_file}")
 
-    prompts = [
+    all_prompts = [
         line.strip()
         for line in prompts_path.read_text().splitlines()
         if line.strip()
     ]
-    logger.info(f"Loaded {len(prompts):,} prompts from {prompts_path}")
+    logger.info(f"Loaded {len(all_prompts):,} prompts from {prompts_path}")
+
+    # Build list of (global_index, prompt) pairs for this shard
+    if num_shards > 1:
+        if shard_index < 0 or shard_index >= num_shards:
+            raise typer.BadParameter(
+                f"shard-index must be in [0, {num_shards - 1}], got {shard_index}"
+            )
+        work_items = [
+            (i, all_prompts[i]) for i in range(shard_index, len(all_prompts), num_shards)
+        ]
+        logger.info(
+            f"Shard {shard_index}/{num_shards}: processing {len(work_items):,} "
+            f"of {len(all_prompts):,} prompts"
+        )
+    else:
+        work_items = list(enumerate(all_prompts))
+
+    prompts = [p for _, p in work_items]
+    global_indices = [i for i, _ in work_items]
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -100,15 +127,24 @@ def main(
         TimeRemainingColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("Encoding prompts", total=len(prompts))
+        # Skip already-computed embeddings (for resumability)
+        remaining = [
+            (gi, p) for gi, p in zip(global_indices, prompts)
+            if not (out / f"{gi:06d}.pt").exists()
+        ]
+        skipped = len(prompts) - len(remaining)
+        if skipped:
+            logger.info(f"Skipping {skipped:,} already-computed embeddings")
+
+        task = progress.add_task("Encoding prompts", total=len(remaining))
         with torch.inference_mode():
-            for idx, prompt in enumerate(prompts):
+            for gi, prompt in remaining:
                 v_ctx, a_ctx, _ = text_encoder(prompt)
                 data = {
                     "video_context_positive": v_ctx.cpu(),
                     "audio_context_positive": a_ctx.cpu(),
                 }
-                torch.save(data, out / f"{idx:06d}.pt")
+                torch.save(data, out / f"{gi:06d}.pt")
                 progress.advance(task)
 
     logger.info(
