@@ -11,16 +11,17 @@ Model: CodeGoat24/UnifiedReward-Think-qwen3vl-8b
 
 import logging
 import re
-import tempfile
-from pathlib import Path
 
+import numpy as np
 import torch
+from PIL import Image
 from torch import Tensor
 
 from ltx_trainer.rl.rewards import RewardFunction
-from ltx_trainer.video_utils import save_video
 
 logger = logging.getLogger(__name__)
+
+NUM_FRAMES = 8
 
 
 class _UnifiedRewardThinkModel:
@@ -28,29 +29,49 @@ class _UnifiedRewardThinkModel:
 
     DIMENSIONS = ["alignment", "coherence", "style"]
 
-    def __init__(self, model_name: str = "CodeGoat24/UnifiedReward-Think-qwen3vl-8b", fps: float = 2.0) -> None:
+    def __init__(self, model_name: str = "CodeGoat24/UnifiedReward-Think-qwen3vl-8b") -> None:
         """Initialize UnifiedReward-Think model.
 
         Args:
             model_name: HuggingFace model identifier
-            fps: Frames per second for temporary video files
         """
-        from qwen_vl_utils import process_vision_info
         from transformers import AutoModelForVision2Seq, AutoProcessor
 
         logger.info(f"Loading UnifiedReward-Think model: {model_name}")
         self._processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        self._processor.tokenizer.padding_side = "left"
         self._model = (
             AutoModelForVision2Seq.from_pretrained(model_name, torch_dtype=torch.bfloat16, trust_remote_code=True)
             .eval()
             .to("cuda")
         )
-        self._process_vision_info = process_vision_info
-        self._fps = fps
 
         # Cache for storing computed scores by video object id
         self._cache_key: int | None = None
         self._cache_scores: dict[str, float] | None = None
+
+        # Batch cache: filled by precompute_batch(), keyed by id(video_tensor)
+        self._batch_cache: dict[int, dict[str, float]] = {}
+
+    @staticmethod
+    def _sample_frames(video: Tensor, num_frames: int = NUM_FRAMES) -> list[Image.Image]:
+        """Uniformly sample frames from video tensor and convert to PIL Images.
+
+        Args:
+            video: Video tensor [C, F, H, W] in [0, 1] range
+            num_frames: Number of frames to sample
+
+        Returns:
+            List of PIL Images
+        """
+        total_frames = video.shape[1]
+        indices = np.linspace(0, total_frames - 1, num_frames).astype(int)
+        frames = []
+        for idx in indices:
+            frame = video[:, idx]  # [C, H, W]
+            frame_np = (frame.permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+            frames.append(Image.fromarray(frame_np))
+        return frames
 
     def get_dimension_score(self, video: Tensor, prompt: str, dimension: str) -> float:
         """Get score for a specific dimension, computing all scores on first call per video.
@@ -67,11 +88,24 @@ class _UnifiedRewardThinkModel:
             raise ValueError(f"Invalid dimension: {dimension}. Must be one of {self.DIMENSIONS}")
 
         vid_key = id(video)
+
+        # Check batch cache first (filled by precompute_batch)
+        if vid_key in self._batch_cache:
+            return self._batch_cache[vid_key][dimension]
+
+        # Fallback to single-video computation
         if self._cache_key != vid_key:
             self._cache_scores = self._compute_all(video, prompt)
             self._cache_key = vid_key
 
         return self._cache_scores[dimension]
+
+    def _build_messages(self, frames: list[Image.Image], prompt: str) -> list[dict]:
+        """Build chat messages with sampled frames as images."""
+        eval_prompt = self._build_evaluation_prompt(prompt)
+        content: list[dict] = [{"type": "image", "image": f} for f in frames]
+        content.append({"type": "text", "text": eval_prompt})
+        return [{"role": "user", "content": content}]
 
     def _compute_all(self, video: Tensor, prompt: str) -> dict[str, float]:
         """Run UnifiedReward-Think model and return all dimension scores.
@@ -83,56 +117,71 @@ class _UnifiedRewardThinkModel:
         Returns:
             Dictionary mapping dimension names to scores
         """
-        # Save video to temporary file (UnifiedReward expects file paths)
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
+        frames = self._sample_frames(video)
+        messages = self._build_messages(frames, prompt)
 
-        try:
-            save_video(video, tmp_path, fps=self._fps)
+        text = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self._processor(
+            text=[text],
+            images=frames,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
 
-            # Construct evaluation prompt for UnifiedReward
-            eval_prompt = self._build_evaluation_prompt(prompt)
+        with torch.inference_mode():
+            output_ids = self._model.generate(**inputs, max_new_tokens=512, do_sample=False)
+            output_ids = output_ids[:, inputs["input_ids"].shape[1] :]
+            output_text = self._processor.batch_decode(
+                output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )[0]
 
-            # Prepare model inputs
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "video", "video": str(tmp_path)},
-                        {"type": "text", "text": eval_prompt},
-                    ],
-                }
-            ]
+        return self._parse_output(output_text)
 
-            text = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            image_inputs, video_inputs = self._process_vision_info(messages)
+    def precompute_batch(self, videos: list[Tensor], prompts: list[str]) -> None:
+        """Batch-compute scores for multiple videos in one generate() call.
 
-            inputs = self._processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
+        Results are stored in _batch_cache keyed by id(video_tensor).
+        Subsequent get_dimension_score() calls will read from this cache.
+        """
+        self._batch_cache.clear()
+        n = len(videos)
+        if n == 0:
+            return
+        if n == 1:
+            self._batch_cache[id(videos[0])] = self._compute_all(videos[0], prompts[0])
+            return
+
+        all_texts: list[str] = []
+        all_images: list[Image.Image] = []
+
+        for video, prompt in zip(videos, prompts):
+            frames = self._sample_frames(video)
+            messages = self._build_messages(frames, prompt)
+            text = self._processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
             )
-            inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
+            all_texts.append(text)
+            all_images.extend(frames)
 
-            # Generate model response
-            with torch.inference_mode():
-                output_ids = self._model.generate(**inputs, max_new_tokens=512, do_sample=False)
-                # Remove input tokens from output
-                output_ids = output_ids[:, inputs["input_ids"].shape[1] :]
-                output_text = self._processor.batch_decode(
-                    output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-                )[0]
+        inputs = self._processor(
+            text=all_texts,
+            images=all_images,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(self._model.device) for k, v in inputs.items()}
 
-            # Parse output to extract scores
-            scores = self._parse_output(output_text)
-            return scores
+        with torch.inference_mode():
+            output_ids = self._model.generate(**inputs, max_new_tokens=512, do_sample=False)
+            input_len = inputs["input_ids"].shape[1]
+            output_ids = output_ids[:, input_len:]
+            output_texts = self._processor.batch_decode(
+                output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
 
-        finally:
-            # Clean up temporary file
-            if tmp_path.exists():
-                tmp_path.unlink()
+        for video, text in zip(videos, output_texts):
+            self._batch_cache[id(video)] = self._parse_output(text)
 
     def _build_evaluation_prompt(self, text_prompt: str) -> str:
         """Build the evaluation prompt for UnifiedReward.
@@ -239,3 +288,7 @@ class UnifiedRewardThinkDimensionReward(RewardFunction):
             Score for this dimension (1.0 to 5.0 scale)
         """
         return self._model.get_dimension_score(video, prompt, self._dimension)
+
+    def precompute_batch(self, videos: list[Tensor], prompts: list[str]) -> None:
+        """Batch-precompute scores for multiple videos (delegates to shared model)."""
+        self._model.precompute_batch(videos, prompts)

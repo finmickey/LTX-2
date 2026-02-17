@@ -291,7 +291,6 @@ class RLTrainer:
                     local_individual_rewards.append(individual)
                     del pixel_video
                 del decoded_batch
-
                 del all_latents, all_positions
 
                 epoch_samples.append({

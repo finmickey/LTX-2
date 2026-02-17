@@ -14,11 +14,13 @@ import textwrap
 from pathlib import Path
 
 BASE_DIR = Path("outputs/checkpoint_inference_step500_768x512x121_base")
+BASE_CFG_STG_DIR = Path("outputs/checkpoint_inference_step500_768x512x121_base_cfg_stg")
 LORA_DIR = Path("outputs/checkpoint_inference_step500_768x512x121")
 OUTPUT_PATH = Path("outputs/comparison_grid_768x512x121.mp4")
 
 ROWS = [
     ("Base", BASE_DIR),
+    ("Base + CFG/STG", BASE_CFG_STG_DIR),
     ("Step 500", LORA_DIR),
 ]
 

@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """Generate validation videos from an RL checkpoint (or base model) for comparison.
 
-Matches the exact during-training validation pipeline:
-- generate_video_latent() (no CFG, no STG, no audio)
-- 20 denoising steps, seed=42
-- EMA weights (checkpoint already contains EMA)
-
 Usage:
-    # With LoRA checkpoint:
+    # With LoRA checkpoint (no CFG/STG, matches training validation):
     python scripts/infer_checkpoint.py
-    # Base model (no LoRA):
+    # Base model (no LoRA, no CFG/STG):
     python scripts/infer_checkpoint.py --no-lora
+    # Base model with CFG + STG (full inference pipeline):
+    python scripts/infer_checkpoint.py --no-lora --with-cfg-stg
 """
 
 import argparse
@@ -34,10 +31,18 @@ LORA_PATH = "outputs/rl_nft_clip_only_ts5_run2/checkpoints/rl_lora_weights_step_
 
 HEIGHT = 512
 WIDTH = 768
-NUM_FRAMES = 241
+NUM_FRAMES = 121
 NUM_STEPS = 20
 FRAME_RATE = 25.0
 SEED = 42
+
+# CFG/STG settings (match validation config)
+CFG_STEPS = 50
+GUIDANCE_SCALE = 4.0
+STG_SCALE = 1.0
+STG_BLOCKS = [29]
+STG_MODE = "stg_av"
+NEGATIVE_PROMPT = "worst quality, inconsistent motion, blurry, jittery, distorted"
 
 VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
 
@@ -83,9 +88,14 @@ def decode_latent_to_pixels(latent, vae_decoder, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-lora", action="store_true", help="Use base model without LoRA")
+    parser.add_argument("--with-cfg-stg", action="store_true", help="Use CFG + STG (full inference pipeline)")
     args = parser.parse_args()
 
-    suffix = "base" if args.no_lora else "lora"
+    # Build output dir suffix
+    if args.with_cfg_stg:
+        suffix = "base_cfg_stg" if args.no_lora else "lora_cfg_stg"
+    else:
+        suffix = "base" if args.no_lora else "lora"
     output_dir = Path(f"outputs/checkpoint_inference_step500_{WIDTH}x{HEIGHT}x{NUM_FRAMES}_{suffix}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -132,36 +142,77 @@ def main():
 
     vae_decoder = components.video_vae_decoder.to(vae_device)
 
-    print("Encoding prompts...")
-    text_encoder = components.text_encoder.to(gen_device)
-    prompt_embeddings = {}
-    for nickname, prompt in PROMPTS:
-        with torch.inference_mode():
-            v_ctx, a_ctx, _ = text_encoder(prompt)
-        prompt_embeddings[nickname] = v_ctx.to(gen_device)
-    del text_encoder
-    torch.cuda.empty_cache()
+    if args.with_cfg_stg:
+        # Use ValidationSampler for CFG + STG
+        from ltx_trainer.validation_sampler import GenerationConfig, ValidationSampler
 
-    for nickname, prompt in PROMPTS:
-        output_path = output_dir / f"{nickname}.mp4"
-        video_embeds = prompt_embeddings[nickname]
-        print(f"\nGenerating: {nickname} - {prompt}")
-
-        latent, _, _ = generate_video_latent(
+        print("Using CFG + STG pipeline")
+        # Keep text encoder on gen_device for ValidationSampler
+        text_encoder = components.text_encoder.to(gen_device)
+        sampler = ValidationSampler(
             transformer=transformer,
-            video_prompt_embeds=video_embeds,
-            num_frames=NUM_FRAMES,
-            height=HEIGHT,
-            width=WIDTH,
-            num_steps=NUM_STEPS,
-            frame_rate=FRAME_RATE,
-            seed=SEED,
-            device=gen_device,
+            vae_decoder=vae_decoder,
+            vae_encoder=None,
+            text_encoder=text_encoder,
+            audio_decoder=None,
+            vocoder=None,
         )
 
-        pixel_video = decode_latent_to_pixels(latent[:1], vae_decoder, vae_device)
-        save_video(video_tensor=pixel_video, output_path=output_path, fps=FRAME_RATE)
-        print(f"  Saved: {output_path}")
+        for nickname, prompt in PROMPTS:
+            output_path = output_dir / f"{nickname}.mp4"
+            print(f"\nGenerating: {nickname} - {prompt}")
+
+            gen_config = GenerationConfig(
+                prompt=prompt,
+                negative_prompt=NEGATIVE_PROMPT,
+                height=HEIGHT,
+                width=WIDTH,
+                num_frames=NUM_FRAMES,
+                frame_rate=FRAME_RATE,
+                num_inference_steps=NUM_STEPS,
+                guidance_scale=GUIDANCE_SCALE,
+                seed=SEED,
+                generate_audio=False,
+                stg_scale=STG_SCALE,
+                stg_blocks=STG_BLOCKS,
+                stg_mode=STG_MODE,
+            )
+
+            video, _ = sampler.generate(config=gen_config, device=gen_device)
+            save_video(video_tensor=video, output_path=output_path, fps=FRAME_RATE)
+            print(f"  Saved: {output_path}")
+    else:
+        # No CFG/STG — use generate_video_latent directly
+        print("Encoding prompts...")
+        text_encoder = components.text_encoder.to(gen_device)
+        prompt_embeddings = {}
+        for nickname, prompt in PROMPTS:
+            with torch.inference_mode():
+                v_ctx, a_ctx, _ = text_encoder(prompt)
+            prompt_embeddings[nickname] = v_ctx.to(gen_device)
+        del text_encoder
+        torch.cuda.empty_cache()
+
+        for nickname, prompt in PROMPTS:
+            output_path = output_dir / f"{nickname}.mp4"
+            video_embeds = prompt_embeddings[nickname]
+            print(f"\nGenerating: {nickname} - {prompt}")
+
+            latent, _, _ = generate_video_latent(
+                transformer=transformer,
+                video_prompt_embeds=video_embeds,
+                num_frames=NUM_FRAMES,
+                height=HEIGHT,
+                width=WIDTH,
+                num_steps=NUM_STEPS,
+                frame_rate=FRAME_RATE,
+                seed=SEED,
+                device=gen_device,
+            )
+
+            pixel_video = decode_latent_to_pixels(latent[:1], vae_decoder, vae_device)
+            save_video(video_tensor=pixel_video, output_path=output_path, fps=FRAME_RATE)
+            print(f"  Saved: {output_path}")
 
     print(f"\nDone! All videos saved to {output_dir}")
 
