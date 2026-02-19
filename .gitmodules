@@ -1,3 +1,6 @@
 [submodule "DiffusionNFT"]
 	path = DiffusionNFT
 	url = https://github.com/NVlabs/DiffusionNFT.git
+[submodule "ParetoNFT"]
+	path = ParetoNFT
+	url = https://github.com/Shelley-Golan/ParetoNFT

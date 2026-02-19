@@ -50,8 +50,10 @@ from ltx_trainer.video_utils import save_video
 from .ema import EMAWrapper
 from .embedding_store import LazyEmbeddingStore
 from .generation import generate_video_latent
-from .nft_loss import compute_nft_loss
+from .nft_loss import compute_nft_loss, compute_per_objective_nft_loss
+from .preference_sampling import sample_preference_for_prompt
 from .rewards import get_reward_functions
+from .stat_tracker import compute_pareto_advantages
 
 IS_MAIN_PROCESS = os.environ.get("LOCAL_RANK", "0") == "0"
 VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
@@ -95,6 +97,15 @@ class RLTrainer:
         for rc in self._rl_config.rewards:
             self._reward_fns.extend(get_reward_functions(rc.type))
 
+        # Reward metadata for pareto mode
+        self._reward_names = [name for _, name in self._reward_fns]
+        reward_weights_list: list[float] = []
+        for rc in self._rl_config.rewards:
+            expanded = get_reward_functions(rc.type)
+            reward_weights_list.extend([rc.weight] * len(expanded))
+        self._reward_weights = torch.tensor(reward_weights_list, dtype=torch.float32)
+        self._num_rewards = len(self._reward_fns)
+
         # Patchifier for unpatchify during decode
         self._video_patchifier = VideoLatentPatchifier(patch_size=1)
 
@@ -121,6 +132,7 @@ class RLTrainer:
         """
         cfg = self._config
         rl_cfg = self._rl_config
+        preference_mode = rl_cfg.preference_mode
         device = self._accelerator.device
         rank = self._accelerator.process_index
         num_processes = self._accelerator.num_processes
@@ -224,6 +236,13 @@ class RLTrainer:
                 cached = self._cached_prompt_embeddings[prompt_idx]
                 video_prompt_embeds = cached.video_context_positive.to(device)
 
+                # Sample preference vector BEFORE generation (for future model conditioning)
+                pref = None
+                if preference_mode == "pareto":
+                    pref = sample_preference_for_prompt(
+                        cached.prompt_text, self._num_rewards, cfg.seed, epoch, prompt_cycle_idx - 1,
+                    )  # (R,) tensor
+
                 gen_seed_base = (
                     epoch * num_prompts_per_epoch * num_processes * samples_per_gpu
                     + p_idx * num_processes * samples_per_gpu
@@ -301,6 +320,8 @@ class RLTrainer:
                     "prompt_embeds": video_prompt_embeds,
                     "prompt_idx": prompt_idx,
                     "gen_sigmas": gen_sigmas,
+                    "prompt_text": cached.prompt_text,
+                    "preferences": pref,  # (R,) tensor or None
                 })
 
             timings["generation"] = total_gen_time
@@ -330,21 +351,84 @@ class RLTrainer:
                     gi[name] = self._accelerator.gather(local_vals)  # [K]
                 all_gathered_individual.append(gi)
 
-            # Per-prompt advantages with global std (matching reference)
             all_flat_rewards = torch.cat(all_prompt_rewards)  # [num_prompts_per_epoch * K]
-            global_std = all_flat_rewards.std().item() + 1e-6
 
-            # Compute per-prompt advantages: (reward - prompt_mean) / global_std
-            # Then clip and map to [0, 1]
+            # Per-prompt advantages and (for pareto mode) per-objective advantages/preferences
             per_prompt_advantages: list[list[float]] = []
-            for rewards_k in all_prompt_rewards:
-                prompt_mean = rewards_k.mean().item()
-                advs = []
-                for r in rewards_k.tolist():
-                    adv = (r - prompt_mean) / global_std
-                    adv = max(-rl_cfg.adv_clip_max, min(rl_cfg.adv_clip_max, adv))
-                    advs.append(adv / rl_cfg.adv_clip_max / 2.0 + 0.5)
-                per_prompt_advantages.append(advs)
+            per_prompt_advantages_per_obj: list[Tensor] = []  # pareto: list of (K, R)
+            per_prompt_preferences: list[Tensor] = []  # pareto: list of (K, R)
+
+            if preference_mode == "pareto":
+                # Build reward_vectors (N_total, R) and prompt_indices from gathered individual rewards
+                K = rl_cfg.num_samples_per_prompt
+                reward_vectors_list = []
+                prompt_indices_list: list[int] = []
+                for p_idx, gi in enumerate(all_gathered_individual):
+                    # gi[name] is (K,) for each reward name
+                    prompt_reward_vec = torch.stack([gi[name] for name in self._reward_names], dim=1)  # (K, R)
+                    # Apply reward weights
+                    prompt_reward_vec = prompt_reward_vec * self._reward_weights.to(device)
+                    reward_vectors_list.append(prompt_reward_vec)
+                    prompt_indices_list.extend([p_idx] * K)
+
+                reward_vectors = torch.cat(reward_vectors_list, dim=0)  # (N_total, R)
+                all_advantages_per_obj = compute_pareto_advantages(
+                    reward_vectors, prompt_indices_list, rl_cfg.adv_clip_max,
+                )  # (N_total, R)
+
+                # Build per-prompt structures
+                offset = 0
+                for p_idx, ps in enumerate(epoch_samples):
+                    prompt_advs_obj = all_advantages_per_obj[offset:offset + K]  # (K, R)
+                    per_prompt_advantages_per_obj.append(prompt_advs_obj)
+                    # Expand preference (R,) to (K, R) — all K repeats share same preference
+                    pref_expanded = ps["preferences"].unsqueeze(0).expand(K, -1).to(device)
+                    per_prompt_preferences.append(pref_expanded)
+                    # Legacy scalar advantages not used in pareto mode, but fill for logging
+                    per_prompt_advantages.append([0.5] * K)
+                    offset += K
+            elif preference_mode == "per_reward_zscore":
+                # Independent per-reward z-score: z-score each reward separately, average into one scalar
+                reward_names = [name for _, name in self._reward_fns]
+                R = len(reward_names)
+                K = rl_cfg.num_samples_per_prompt
+
+                # Compute global std per reward across all prompts
+                global_std_per_reward: dict[str, float] = {}
+                for rname in reward_names:
+                    all_vals = torch.cat([gi[rname] for gi in all_gathered_individual])
+                    global_std_per_reward[rname] = all_vals.std().item() + 1e-6
+
+                for p_idx, gi in enumerate(all_gathered_individual):
+                    # Z-score each reward independently: (val - prompt_mean) / global_std
+                    zscores = []
+                    for rname in reward_names:
+                        vals = gi[rname]  # (K,)
+                        prompt_mean = vals.mean().item()
+                        g_std = global_std_per_reward[rname]
+                        z = (vals - prompt_mean) / g_std  # (K,)
+                        zscores.append(z)
+
+                    # Average z-scores across rewards → single scalar per sample
+                    avg_z = torch.stack(zscores, dim=0).mean(dim=0)  # (K,)
+
+                    # Clip and map to [0, 1] (same as legacy)
+                    advs = []
+                    for z_val in avg_z.tolist():
+                        adv = max(-rl_cfg.adv_clip_max, min(rl_cfg.adv_clip_max, z_val))
+                        advs.append(adv / rl_cfg.adv_clip_max / 2.0 + 0.5)
+                    per_prompt_advantages.append(advs)
+            else:
+                # Legacy path: per-prompt z-score → clip → map to [0, 1]
+                global_std = all_flat_rewards.std().item() + 1e-6
+                for rewards_k in all_prompt_rewards:
+                    prompt_mean = rewards_k.mean().item()
+                    advs = []
+                    for r in rewards_k.tolist():
+                        adv = (r - prompt_mean) / global_std
+                        adv = max(-rl_cfg.adv_clip_max, min(rl_cfg.adv_clip_max, adv))
+                        advs.append(adv / rl_cfg.adv_clip_max / 2.0 + 0.5)
+                    per_prompt_advantages.append(advs)
 
             timings["gather"] = self._wall_time() - t0
 
@@ -367,13 +451,18 @@ class RLTrainer:
             for p_idx, ps in enumerate(epoch_samples):
                 local_offset = rank * samples_per_gpu
                 for k in range(samples_per_gpu):
-                    flat_samples.append({
+                    sample_dict = {
                         "latent": ps["latents"][k],
                         "positions": ps["positions"][k],
                         "advantage": per_prompt_advantages[p_idx][local_offset + k],
                         "prompt_embeds": ps["prompt_embeds"],
                         "gen_sigmas": ps["gen_sigmas"],
-                    })
+                    }
+                    if preference_mode == "pareto":
+                        global_k = local_offset + k
+                        sample_dict["advantages_per_obj"] = per_prompt_advantages_per_obj[p_idx][global_k]  # (R,)
+                        sample_dict["preferences"] = per_prompt_preferences[p_idx][global_k]  # (R,)
+                    flat_samples.append(sample_dict)
 
             # Shuffle samples randomly (same seed across GPUs for consistency)
             shuffle_seed = cfg.seed + epoch
@@ -438,10 +527,14 @@ class RLTrainer:
                         xt = (1 - t_expanded) * latent + t_expanded * noise
                         timesteps = t_val.expand(1, seq_len)
 
-                        input_list.append({
+                        input_item = {
                             "latent": latent, "xt": xt,
                             "t_expanded": t_expanded, "r_tensor": r_tensor,
-                        })
+                        }
+                        if preference_mode == "pareto":
+                            input_item["r_per_obj"] = sample["advantages_per_obj"]  # (R,)
+                            input_item["preferences"] = sample["preferences"]  # (R,)
+                        input_list.append(input_item)
                         xt_list.append(xt)
                         ts_list.append(timesteps)
                         pos_list.append(positions)
@@ -542,18 +635,33 @@ class RLTrainer:
                         batched_xt = torch.cat([si["xt"] for si in input_list], dim=0)
                         batched_x0 = torch.cat([si["latent"] for si in input_list], dim=0)
                         batched_t = torch.cat([si["t_expanded"] for si in input_list], dim=0)
-                        batched_r = torch.cat([si["r_tensor"] for si in input_list], dim=0)
 
-                        loss, metrics = compute_nft_loss(
-                            xt=batched_xt, x0=batched_x0, t=batched_t,
-                            forward_pred=v_new_chunks[k],
-                            old_pred=v_old_all[j_idx].detach(),
-                            ref_pred=v_ref_all[j_idx].detach(),
-                            r=batched_r,
-                            beta=rl_cfg.nft_beta,
-                            kl_beta=rl_cfg.kl_beta,
-                            adv_clip_max=rl_cfg.adv_clip_max,
-                        )
+                        if preference_mode == "pareto":
+                            batched_adv_per_obj = torch.stack([si["r_per_obj"] for si in input_list])  # (B, R)
+                            batched_prefs = torch.stack([si["preferences"] for si in input_list])  # (B, R)
+                            loss, metrics = compute_per_objective_nft_loss(
+                                xt=batched_xt, x0=batched_x0, t=batched_t,
+                                forward_pred=v_new_chunks[k],
+                                old_pred=v_old_all[j_idx].detach(),
+                                ref_pred=v_ref_all[j_idx].detach(),
+                                advantages_per_obj=batched_adv_per_obj,
+                                preferences=batched_prefs,
+                                beta=rl_cfg.nft_beta,
+                                kl_beta=rl_cfg.kl_beta,
+                                adv_clip_max=rl_cfg.adv_clip_max,
+                            )
+                        else:
+                            batched_r = torch.cat([si["r_tensor"] for si in input_list], dim=0)
+                            loss, metrics = compute_nft_loss(
+                                xt=batched_xt, x0=batched_x0, t=batched_t,
+                                forward_pred=v_new_chunks[k],
+                                old_pred=v_old_all[j_idx].detach(),
+                                ref_pred=v_ref_all[j_idx].detach(),
+                                r=batched_r,
+                                beta=rl_cfg.nft_beta,
+                                kl_beta=rl_cfg.kl_beta,
+                                adv_clip_max=rl_cfg.adv_clip_max,
+                            )
                         group_loss = group_loss + loss / effective_grad_accum
 
                         for mkey, mval in metrics.items():
@@ -688,6 +796,19 @@ class RLTrainer:
                     all_vals = torch.cat([gi[name] for gi in all_gathered_individual])
                     log_metrics[f"rl/reward/{name}"] = all_vals.mean().item()
                     log_metrics[f"rl/reward/{name}_std"] = all_vals.std().item() if len(all_vals) > 1 else 0.0
+
+                # Pareto-specific metrics
+                if preference_mode == "pareto":
+                    # Mean preference weight per objective
+                    all_prefs = torch.cat(per_prompt_preferences, dim=0)  # (N_total, R)
+                    for r_idx, name in enumerate(self._reward_names):
+                        log_metrics[f"rl/pref_w/{name}"] = all_prefs[:, r_idx].mean().item()
+                    # Per-objective policy losses from accumulated metrics
+                    if accumulated_metrics_snapshot:
+                        for r_idx, name in enumerate(self._reward_names):
+                            key = f"policy_loss_obj_{r_idx}"
+                            if key in accumulated_metrics_snapshot:
+                                log_metrics[f"rl/policy_loss/{name}"] = accumulated_metrics_snapshot[key]
 
                 for tname, tval in timings.items():
                     log_metrics[f"rl/time/{tname}"] = tval

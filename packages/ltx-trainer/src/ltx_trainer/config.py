@@ -479,6 +479,7 @@ class RewardConfig(ConfigBaseModel):
     """Configuration for a single reward function."""
 
     type: str = Field(description="Reward function name")
+    weight: float = Field(default=1.0, description="Global weight for this objective", gt=0)
 
 
 class RLConfig(ConfigBaseModel):
@@ -524,6 +525,13 @@ class RLConfig(ConfigBaseModel):
     rewards: list[RewardConfig] = Field(
         default=[RewardConfig(type="redness")],
         description="List of reward functions. Combined reward is a simple sum.",
+    )
+
+    preference_mode: str | None = Field(
+        default=None,
+        description="Multi-reward preference mode. None = legacy scalar sum. "
+        "'pareto' = ParetoNFT-style per-objective loss with structured preference sampling "
+        "and per-prompt per-channel z-score normalization.",
     )
 
     nft_beta: float = Field(
@@ -660,6 +668,13 @@ class RLConfig(ConfigBaseModel):
     def validate_gen_dims(cls, v: int) -> int:
         if v % 32 != 0:
             raise ValueError(f"Dimension ({v}) must be divisible by 32")
+        return v
+
+    @field_validator("preference_mode")
+    @classmethod
+    def validate_preference_mode(cls, v: str | None) -> str | None:
+        if v is not None and v not in ("pareto", "per_reward_zscore"):
+            raise ValueError(f"preference_mode must be None, 'pareto', or 'per_reward_zscore', got '{v}'")
         return v
 
     @field_validator("prompts_file")

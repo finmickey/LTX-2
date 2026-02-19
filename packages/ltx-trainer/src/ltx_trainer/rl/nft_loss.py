@@ -82,3 +82,99 @@ def compute_nft_loss(
     }
 
     return total_loss, metrics
+
+
+def compute_per_objective_nft_loss(
+    xt: Tensor,
+    x0: Tensor,
+    t: Tensor,
+    forward_pred: Tensor,
+    old_pred: Tensor,
+    ref_pred: Tensor,
+    advantages_per_obj: Tensor,
+    preferences: Tensor,
+    beta: float,
+    kl_beta: float,
+    adv_clip_max: float = 5.0,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Compute ParetoNFT per-objective loss with preference weighting.
+
+    Like compute_nft_loss but handles multiple reward objectives independently.
+    Positive/negative predictions are shared (computed once), then each objective
+    gets its own r_val from its z-scored advantage.
+
+    Args:
+        xt: Noisy latent [B, seq_len, C].
+        x0: Clean latent [B, seq_len, C].
+        t: Timestep [B, 1, 1] (expanded for broadcasting).
+        forward_pred: v_new from current adapter (has grad) [B, seq_len, C].
+        old_pred: v_old from old adapter (detached) [B, seq_len, C].
+        ref_pred: v_ref from base model (detached) [B, seq_len, C].
+        advantages_per_obj: Raw z-scored advantages [B, R] (NOT mapped to [0,1]).
+        preferences: Preference weights [B, R] summing to 1 per sample.
+        beta: NFT interpolation weight.
+        kl_beta: KL regularization weight.
+        adv_clip_max: Advantage clipping maximum; scales policy loss.
+
+    Returns:
+        Tuple of (total_loss, metrics_dict with detached tensors).
+    """
+    R = advantages_per_obj.shape[1]
+
+    # Positive and negative predictions (shared across objectives)
+    positive_pred = beta * forward_pred + (1 - beta) * old_pred
+    negative_pred = (1 + beta) * old_pred - beta * forward_pred
+
+    # Convert velocity predictions to x0 predictions
+    x0_pos = xt - t * positive_pred
+    x0_neg = xt - t * negative_pred
+
+    # Adaptive weighting (shared across objectives)
+    reduce_dims = tuple(range(1, x0_pos.ndim))
+    with torch.no_grad():
+        weight_pos = (x0_pos.double() - x0.double()).abs().mean(dim=reduce_dims, keepdim=True).clip(min=1e-5).to(x0_pos.dtype)
+        weight_neg = (x0_neg.double() - x0.double()).abs().mean(dim=reduce_dims, keepdim=True).clip(min=1e-5).to(x0_neg.dtype)
+
+    # Weighted MSE loss per sample: [B]
+    pos_loss = ((x0_pos - x0) ** 2 / weight_pos).mean(dim=(-1, -2))
+    neg_loss = ((x0_neg - x0) ** 2 / weight_neg).mean(dim=(-1, -2))
+
+    # Per-objective loss computation
+    policy_losses_per_obj = []
+    for r_idx in range(R):
+        adv_r = advantages_per_obj[:, r_idx]  # (B,)
+        adv_clip_r = torch.clamp(adv_r, -adv_clip_max, adv_clip_max)
+        r_val = 0.5 + 0.5 * torch.clamp(adv_clip_r / adv_clip_max, -1.0, 1.0)
+        loss_r = r_val * pos_loss / beta + (1.0 - r_val) * neg_loss / beta
+        policy_losses_per_obj.append(loss_r)
+
+    # Stack: (B, R)
+    policy_losses_per_obj = torch.stack(policy_losses_per_obj, dim=1)
+
+    # Preference-weighted combination: (B,)
+    weighted_policy_loss = (preferences * policy_losses_per_obj).sum(dim=1)
+
+    # Scale by adv_clip_max (matching ParetoNFT reference)
+    policy_loss = (weighted_policy_loss * adv_clip_max).mean()
+
+    # KL regularization (unchanged)
+    kl_loss = ((forward_pred - ref_pred) ** 2).mean()
+
+    total_loss = policy_loss + kl_beta * kl_loss
+
+    metrics = {
+        "policy_loss": weighted_policy_loss.mean().detach(),
+        "policy_loss_scaled": policy_loss.detach(),
+        "kl_loss": kl_loss.detach(),
+        "pos_loss": pos_loss.mean().detach(),
+        "neg_loss": neg_loss.mean().detach(),
+        "total_loss": total_loss.detach(),
+    }
+
+    # Per-objective policy losses for logging
+    for r_idx in range(R):
+        metrics[f"policy_loss_obj_{r_idx}"] = (
+            policy_losses_per_obj[:, r_idx] * adv_clip_max
+        ).mean().detach()
+
+    return total_loss, metrics

@@ -351,11 +351,8 @@ class _ClipScoreModel:
         self._tokenizer = CLIPTokenizerFast.from_pretrained(self.MODEL_NAME)
         self._transform = _get_clip_image_transform(self._model.config.vision_config.image_size)
 
-    def compute_score(self, video: Tensor, prompt: str) -> float:
-        """Compute CLIP text-image cosine similarity on the first frame.
-
-        Returns a score rescaled to [1, 4] to match VideoScore range.
-        """
+    def _get_similarity(self, video: Tensor, prompt: str) -> float:
+        """Compute raw CLIP text-image cosine similarity on the first frame."""
         # Extract first frame: video is [C, F, H, W] -> [C, H, W]
         frame = video[:, 0, :, :]
 
@@ -374,7 +371,18 @@ class _ClipScoreModel:
         # L2 normalize and compute cosine similarity
         image_embeds = nn.functional.normalize(image_embeds, dim=-1)
         text_embeds = nn.functional.normalize(text_embeds, dim=-1)
-        sim = (image_embeds * text_embeds).sum(dim=-1).item()
+        return (image_embeds * text_embeds).sum(dim=-1).item()
+
+    def compute_raw_similarity(self, video: Tensor, prompt: str) -> float:
+        """Compute raw CLIP cosine similarity (no rescaling)."""
+        return self._get_similarity(video, prompt)
+
+    def compute_score(self, video: Tensor, prompt: str) -> float:
+        """Compute CLIP text-image cosine similarity on the first frame.
+
+        Returns a score rescaled to [1, 4] to match VideoScore range.
+        """
+        sim = self._get_similarity(video, prompt)
 
         # Rescale from ~[0.15, 0.40] to [1, 4]
         score = float(np.clip((sim - 0.15) / 0.25, 0.0, 1.0)) * 3.0 + 1.0
@@ -389,6 +397,48 @@ class ClipScoreReward(RewardFunction):
 
     def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         return self._model.compute_score(video, prompt)
+
+
+class SketchPlusClipReward(RewardFunction):
+    """Sum of raw sketch score and raw CLIP cosine similarity on the first frame.
+
+    No artificial rescaling — NFT z-score normalization handles scale differences.
+    """
+
+    def __init__(self, clip_model: _ClipScoreModel) -> None:
+        from ltx_trainer.rl.rewards_sketch import get_sketch_scorer
+
+        self._sketch_scorer = get_sketch_scorer()
+        self._clip_model = clip_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        # Sketch score on first frame (raw, no rescaling)
+        frame = video[:, 0, :, :].unsqueeze(0)
+        sketch_total, _ = self._sketch_scorer.score(frame)
+        sketch_raw = sketch_total[0].item()
+
+        # CLIP cosine similarity (raw, no rescaling)
+        clip_raw = self._clip_model.compute_raw_similarity(video, prompt)
+
+        return sketch_raw + clip_raw
+
+
+class RealisticClipReward(RewardFunction):
+    """CLIP text-image alignment with a photorealistic prompt prefix.
+
+    Prepends "A photorealistic, high quality, 4K, camera-captured snapshot of"
+    to the prompt before computing CLIP similarity on the first frame.
+    Score is in [1, 4] to match other rewards.
+    """
+
+    PREFIX = "A photorealistic, high quality, 4K, camera-captured snapshot of "
+
+    def __init__(self, clip_model: _ClipScoreModel) -> None:
+        self._clip_model = clip_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        modified_prompt = self.PREFIX + prompt
+        return self._clip_model.compute_score(video, modified_prompt)
 
 
 class VideoScoreDimensionReward(RewardFunction):
@@ -423,8 +473,9 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
     Returns:
         List of (RewardFunction, display_name) tuples.
     """
+    global _video_score_model, _clip_score_model, _video_score2_model, _unifiedreward_think_model
+
     if name == "video_score":
-        global _video_score_model
         if _video_score_model is None:
             _video_score_model = _VideoScoreModel()
         result = []
@@ -435,7 +486,6 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
         return result
 
     if name == "clip_score":
-        global _clip_score_model
         if _clip_score_model is None:
             _clip_score_model = _ClipScoreModel()
         return [(ClipScoreReward(_clip_score_model), "clip_score")]
@@ -443,7 +493,6 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
     if name == "video_score2":
         from ltx_trainer.rl.rewards_videoscore2 import _VideoScore2Model, VideoScore2DimensionReward
 
-        global _video_score2_model
         if _video_score2_model is None:
             _video_score2_model = _VideoScore2Model()
         result = []
@@ -455,7 +504,6 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
     if name == "unifiedreward_think":
         from ltx_trainer.rl.rewards_unifiedreward import _UnifiedRewardThinkModel, UnifiedRewardThinkDimensionReward
 
-        global _unifiedreward_think_model
         if _unifiedreward_think_model is None:
             _unifiedreward_think_model = _UnifiedRewardThinkModel()
         result = []
@@ -463,6 +511,22 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
             reward = UnifiedRewardThinkDimensionReward(_unifiedreward_think_model, dim_name)
             result.append((reward, f"unifiedreward_{dim_name}"))
         return result
+
+    if name == "sketch":
+        from ltx_trainer.rl.rewards_sketch import SketchReward, get_sketch_scorer
+
+        scorer = get_sketch_scorer()
+        return [(SketchReward(scorer), "sketch")]
+
+    if name == "sketch_plus_clip":
+        if _clip_score_model is None:
+            _clip_score_model = _ClipScoreModel()
+        return [(SketchPlusClipReward(_clip_score_model), "sketch_plus_clip")]
+
+    if name == "realistic_clip":
+        if _clip_score_model is None:
+            _clip_score_model = _ClipScoreModel()
+        return [(RealisticClipReward(_clip_score_model), "realistic_clip")]
 
     reward_classes: dict[str, type[RewardFunction]] = {
         "redness": RednessReward,
@@ -477,7 +541,10 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
     }
 
     if name not in reward_classes:
-        available = list(reward_classes.keys()) + ["video_score", "clip_score", "video_score2", "unifiedreward_think"]
+        available = list(reward_classes.keys()) + [
+            "video_score", "clip_score", "video_score2", "unifiedreward_think",
+            "sketch", "sketch_plus_clip", "realistic_clip",
+        ]
         raise ValueError(f"Unknown reward function: {name}. Available: {available}")
 
     return [(reward_classes[name](), name)]
