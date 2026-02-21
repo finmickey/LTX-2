@@ -14,6 +14,7 @@ Always use `uv run --no-sync` (pypi.nvidia.com is flaky, skip sync).
 - Location: `configs/` (e.g. `configs/rl_videoscore_multistep_run2.yaml`)
 - Naming convention: `rl_<reward>_<variant>_run<N>.yaml`
 - `output_dir` in the config controls where outputs go (e.g. `outputs/rl_videoscore_multistep_run2`)
+- **IMPORTANT:** Always use a NEW unique run name (increment `run<N>`) for each launch, even when resuming from a checkpoint. This prevents overwriting validation videos, checkpoints, and logs from previous runs.
 
 ## Logs and Outputs
 

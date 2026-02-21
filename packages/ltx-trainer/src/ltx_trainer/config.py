@@ -479,6 +479,7 @@ class RewardConfig(ConfigBaseModel):
     """Configuration for a single reward function."""
 
     type: str = Field(description="Reward function name")
+    name: str | None = Field(default=None, description="Display name override for this reward")
     weight: float = Field(default=1.0, description="Global weight for this objective", gt=0)
 
 

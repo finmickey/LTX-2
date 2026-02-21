@@ -441,6 +441,134 @@ class RealisticClipReward(RewardFunction):
         return self._clip_model.compute_score(video, modified_prompt)
 
 
+class RealisticPlusClipReward(RewardFunction):
+    """Sum of raw realism score and raw CLIP cosine similarity on the first frame.
+
+    Symmetric counterpart to SketchPlusClipReward for balanced Pareto training.
+    Uses PACS photo evidence + texture/color metrics + CLIP similarity.
+    No artificial rescaling — NFT z-score normalization handles scale differences.
+    """
+
+    def __init__(self, clip_model: _ClipScoreModel) -> None:
+        from ltx_trainer.rl.rewards_sketch import get_realistic_scorer
+
+        self._realistic_scorer = get_realistic_scorer()
+        self._clip_model = clip_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        # Realism score on first frame (raw, no rescaling)
+        frame = video[:, 0, :, :].unsqueeze(0)
+        realistic_total, _ = self._realistic_scorer.score(frame)
+        realistic_raw = realistic_total[0].item()
+
+        # CLIP cosine similarity (raw, no rescaling)
+        clip_raw = self._clip_model.compute_raw_similarity(video, prompt)
+
+        return realistic_raw + clip_raw
+
+
+class _PickScoreModel:
+    """Shared PickScore model for text-image preference scoring (loaded once, kept on GPU)."""
+
+    PROCESSOR_NAME = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+    MODEL_NAME = "yuvalkirstain/PickScore_v1"
+
+    def __init__(self) -> None:
+        from transformers import AutoModel, AutoProcessor
+
+        self._processor = AutoProcessor.from_pretrained(self.PROCESSOR_NAME)
+        self._model = AutoModel.from_pretrained(self.MODEL_NAME).eval().to("cuda", dtype=torch.bfloat16)
+
+    def compute_raw_score(self, video: Tensor, prompt: str) -> float:
+        """Compute PickScore on the first frame. Returns score in ~[0, 1] (logit_scale * cos_sim / 26)."""
+        from PIL import Image as PILImage
+
+        frame = video[:, 0, :, :]  # (C, H, W)
+        frame_u8 = (frame * 255).round().clamp(0, 255).to(torch.uint8).cpu()
+        pil_img = PILImage.fromarray(frame_u8.permute(1, 2, 0).numpy())
+
+        image_inputs = self._processor(images=pil_img, return_tensors="pt")
+        image_inputs = {k: v.to(self._model.device) for k, v in image_inputs.items()}
+
+        text_inputs = self._processor(text=prompt, padding=True, truncation=True, max_length=77, return_tensors="pt")
+        text_inputs = {k: v.to(self._model.device) for k, v in text_inputs.items()}
+
+        with torch.inference_mode():
+            image_embs = self._model.get_image_features(**image_inputs)
+            if not isinstance(image_embs, Tensor):
+                image_embs = image_embs.pooler_output
+            image_embs = nn.functional.normalize(image_embs, dim=-1)
+
+            text_embs = self._model.get_text_features(**text_inputs)
+            if not isinstance(text_embs, Tensor):
+                text_embs = text_embs.pooler_output
+            text_embs = nn.functional.normalize(text_embs, dim=-1)
+
+        logit_scale = self._model.logit_scale.exp()
+        score = (logit_scale * (text_embs @ image_embs.T)).item()
+        return score / 26.0  # normalize to ~[0, 1] (same as ParetoNFT)
+
+
+class SketchPlusPickScoreReward(RewardFunction):
+    """Sum of raw sketch score and PickScore on the first frame."""
+
+    def __init__(self, pickscore_model: _PickScoreModel) -> None:
+        from ltx_trainer.rl.rewards_sketch import get_sketch_scorer
+
+        self._sketch_scorer = get_sketch_scorer()
+        self._pickscore_model = pickscore_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        frame = video[:, 0, :, :].unsqueeze(0)
+        sketch_total, _ = self._sketch_scorer.score(frame)
+        sketch_raw = sketch_total[0].item()
+        pick_raw = self._pickscore_model.compute_raw_score(video, prompt)
+        return sketch_raw + pick_raw
+
+
+class RealisticPlusPickScoreReward(RewardFunction):
+    """Sum of raw realism score and PickScore on the first frame."""
+
+    def __init__(self, pickscore_model: _PickScoreModel) -> None:
+        from ltx_trainer.rl.rewards_sketch import get_realistic_scorer
+
+        self._realistic_scorer = get_realistic_scorer()
+        self._pickscore_model = pickscore_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        frame = video[:, 0, :, :].unsqueeze(0)
+        realistic_total, _ = self._realistic_scorer.score(frame)
+        realistic_raw = realistic_total[0].item()
+        pick_raw = self._pickscore_model.compute_raw_score(video, prompt)
+        return realistic_raw + pick_raw
+
+
+class PickScoreReward(RewardFunction):
+    """Raw PickScore text-image preference score on the first frame."""
+
+    def __init__(self, pickscore_model: _PickScoreModel) -> None:
+        self._pickscore_model = pickscore_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        return self._pickscore_model.compute_raw_score(video, prompt)
+
+
+class RealisticPickScoreReward(RewardFunction):
+    """PickScore with a photorealistic prompt prefix.
+
+    Prepends "A photorealistic, high quality, 4K, camera-captured snapshot of"
+    to the prompt before computing PickScore on the first frame.
+    """
+
+    PREFIX = "A photorealistic, high quality, 4K, camera-captured snapshot of "
+
+    def __init__(self, pickscore_model: _PickScoreModel) -> None:
+        self._pickscore_model = pickscore_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        return self._pickscore_model.compute_raw_score(video, self.PREFIX + prompt)
+
+
 class VideoScoreDimensionReward(RewardFunction):
     """Single dimension of VideoScore-v1.1."""
 
@@ -456,8 +584,23 @@ class VideoScoreDimensionReward(RewardFunction):
 
 _video_score_model: _VideoScoreModel | None = None
 _clip_score_model: _ClipScoreModel | None = None
+_pickscore_model: _PickScoreModel | None = None
 _video_score2_model: object | None = None
 _unifiedreward_think_model: object | None = None
+
+
+def count_reward_dimensions(reward_type: str) -> int:
+    """Return the number of scalar reward dimensions for a given reward type.
+
+    Lightweight lookup (no model loading) used to compute preference_dim
+    before heavy reward models are loaded.
+    """
+    _REWARD_DIMENSIONS = {
+        "video_score": 5,
+        "video_score2": 3,
+        "unifiedreward_think": 3,
+    }
+    return _REWARD_DIMENSIONS.get(reward_type, 1)
 
 
 def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
@@ -473,7 +616,7 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
     Returns:
         List of (RewardFunction, display_name) tuples.
     """
-    global _video_score_model, _clip_score_model, _video_score2_model, _unifiedreward_think_model
+    global _video_score_model, _clip_score_model, _pickscore_model, _video_score2_model, _unifiedreward_think_model
 
     if name == "video_score":
         if _video_score_model is None:
@@ -528,6 +671,31 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
             _clip_score_model = _ClipScoreModel()
         return [(RealisticClipReward(_clip_score_model), "realistic_clip")]
 
+    if name == "realistic_plus_clip":
+        if _clip_score_model is None:
+            _clip_score_model = _ClipScoreModel()
+        return [(RealisticPlusClipReward(_clip_score_model), "realistic_plus_clip")]
+
+    if name == "sketch_plus_pickscore":
+        if _pickscore_model is None:
+            _pickscore_model = _PickScoreModel()
+        return [(SketchPlusPickScoreReward(_pickscore_model), "sketch_plus_pickscore")]
+
+    if name == "realistic_plus_pickscore":
+        if _pickscore_model is None:
+            _pickscore_model = _PickScoreModel()
+        return [(RealisticPlusPickScoreReward(_pickscore_model), "realistic_plus_pickscore")]
+
+    if name == "pickscore":
+        if _pickscore_model is None:
+            _pickscore_model = _PickScoreModel()
+        return [(PickScoreReward(_pickscore_model), "pickscore")]
+
+    if name == "realistic_pickscore":
+        if _pickscore_model is None:
+            _pickscore_model = _PickScoreModel()
+        return [(RealisticPickScoreReward(_pickscore_model), "realistic_pickscore")]
+
     reward_classes: dict[str, type[RewardFunction]] = {
         "redness": RednessReward,
         "blueness": BluenessReward,
@@ -543,7 +711,9 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
     if name not in reward_classes:
         available = list(reward_classes.keys()) + [
             "video_score", "clip_score", "video_score2", "unifiedreward_think",
-            "sketch", "sketch_plus_clip", "realistic_clip",
+            "sketch", "sketch_plus_clip", "realistic_clip", "realistic_plus_clip",
+            "sketch_plus_pickscore", "realistic_plus_pickscore",
+            "pickscore", "realistic_pickscore",
         ]
         raise ValueError(f"Unknown reward function: {name}. Available: {available}")
 

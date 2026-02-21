@@ -30,6 +30,7 @@ def generate_video_latent(
     frame_rate: float,
     seed: int | list[int],
     device: torch.device,
+    preference: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Generate clean video latent(s) using the denoising loop.
 
@@ -56,6 +57,12 @@ def generate_video_latent(
     """
     seeds = seed if isinstance(seed, list) else [seed]
     batch_size = len(seeds)
+
+    # Expand preference from (R,) to (B, R) if needed
+    if preference is not None:
+        if preference.dim() == 1:
+            preference = preference.unsqueeze(0).expand(batch_size, -1)
+        preference = preference.to(device=device, dtype=torch.bfloat16)
 
     patchifier = VideoLatentPatchifier(patch_size=1)
 
@@ -112,7 +119,7 @@ def generate_video_latent(
             )
 
             # Single forward pass — no CFG, no STG, no audio
-            denoised_video, _ = x0_model(video=video_modality, audio=None, perturbations=None)
+            denoised_video, _ = x0_model(video=video_modality, audio=None, perturbations=None, preference=preference)
 
             # Apply conditioning mask (keep conditioned tokens clean)
             denoised_video = denoised_video * batched_mask + batched_clean.float() * (

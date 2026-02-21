@@ -50,6 +50,19 @@ class _PACSScorer:
         sketch_idx = self._label2id["sketch"]
         return scaled[:, sketch_idx]
 
+    @torch.no_grad()
+    def score_photo_evidence(self, pil_images: list) -> Tensor:
+        """Return photo evidence (softplus-scaled logit / 10) for each PIL image.
+
+        Returns:
+            Tensor [N] on CUDA.
+        """
+        inputs = self._processor(images=pil_images, return_tensors="pt").to("cuda")
+        outputs = self._model(**inputs)
+        scaled = F.softplus(outputs.logits) / 10.0
+        photo_idx = self._label2id["photo"]
+        return scaled[:, photo_idx]
+
 
 class _SketchScorer:
     """GPU-optimized sketch scorer combining PACS evidence with Sobel edge metrics.
@@ -194,9 +207,132 @@ class _SketchScorer:
         return total, details
 
 
+class _RealisticScorer:
+    """GPU-optimized realism scorer: PACS photo evidence + texture/color metrics.
+
+    Symmetric counterpart to _SketchScorer for balanced Pareto training.
+    Four scoring components:
+    - PACS photo evidence (classifier-based)
+    - Low edge density bonus (inverse of sketch's edge band-pass)
+    - Background texture richness (Sobel magnitude outside edges)
+    - Natural color variance (penalizes flat/monochrome sketch look)
+    """
+
+    def __init__(
+        self,
+        pacs_scorer: _PACSScorer,
+        edge_density_target: float = 0.05,
+        edge_density_tol: float = 0.04,
+        edge_thresh_quantile: float = 0.90,
+        w_pacs: float = 1.0,
+        w_low_edge: float = 1.2,
+        w_texture: float = 1.2,
+        w_color: float = 0.4,
+    ) -> None:
+        self._pacs = pacs_scorer
+        self._edge_density_target = edge_density_target
+        self._edge_density_tol = edge_density_tol
+        self._edge_thresh_quantile = edge_thresh_quantile
+        self._w_pacs = w_pacs
+        self._w_low_edge = w_low_edge
+        self._w_texture = w_texture
+        self._w_color = w_color
+
+        # Sobel kernels (same as _SketchScorer)
+        kx = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+            dtype=torch.float32, device="cuda",
+        ).view(1, 1, 3, 3)
+        ky = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+            dtype=torch.float32, device="cuda",
+        ).view(1, 1, 3, 3)
+        self._kx = kx
+        self._ky = ky
+
+    def _to_gray(self, x: Tensor) -> Tensor:
+        """Convert NCHW float [0,1] to grayscale N1HW."""
+        if x.shape[1] == 3:
+            return 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+        return x[:, 0:1]
+
+    def _sobel_mag(self, gray: Tensor) -> Tensor:
+        gx = F.conv2d(gray, self._kx, padding=1)
+        gy = F.conv2d(gray, self._ky, padding=1)
+        return torch.sqrt(gx * gx + gy * gy + 1e-8)
+
+    def _edge_mask(self, mag: Tensor) -> Tensor:
+        n = mag.shape[0]
+        flat = mag.view(n, -1)
+        thr = torch.quantile(flat, self._edge_thresh_quantile, dim=1).view(n, 1, 1, 1)
+        return (mag >= thr).float()
+
+    @torch.no_grad()
+    def score(self, images_nchw: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
+        """Compute realism score combining PACS photo evidence and texture metrics.
+
+        Args:
+            images_nchw: Tensor NCHW float in [0,1].
+
+        Returns:
+            (total_score [N], details dict of tensors [N])
+        """
+        x = images_nchw.to("cuda").float().clamp(0.0, 1.0)
+
+        # 1) PACS photo evidence
+        x_u8 = (x * 255).round().to(torch.uint8).detach().cpu()
+        from PIL import Image
+        pil_imgs = [Image.fromarray(img.permute(1, 2, 0).numpy()) for img in x_u8]
+        pacs_photo = self._pacs.score_photo_evidence(pil_imgs)  # [N]
+
+        # 2) Edge metrics (GPU)
+        gray = self._to_gray(x)
+        mag = self._sobel_mag(gray)
+        edge = self._edge_mask(mag)
+
+        # Low edge density: inverse of sketch's edge_band
+        # Sketch rewards ~5% density; realistic rewards being OUTSIDE that band
+        density = edge.mean(dim=(1, 2, 3))
+        edge_band = 1.0 - torch.clamp(
+            torch.abs(density - self._edge_density_target) / (self._edge_density_tol + 1e-8),
+            0.0, 1.0,
+        )
+        low_edge = 1.0 - edge_band
+
+        # Background texture richness: Sobel mag outside edges
+        # Sketch PENALIZES this (wants clean backgrounds); realistic REWARDS it
+        non_edge = 1.0 - edge
+        texture_richness = (mag * non_edge).sum(dim=(1, 2, 3)) / (non_edge.sum(dim=(1, 2, 3)) + 1e-6)
+
+        # Natural color variance: penalize monochrome/flat (sketch look)
+        # High RGB variance per pixel = colorful/realistic
+        if x.shape[1] == 3:
+            pixel_mean = x.mean(dim=1, keepdim=True)  # [N, 1, H, W]
+            color_var = ((x - pixel_mean) ** 2).mean(dim=(1, 2, 3))  # [N]
+        else:
+            color_var = torch.zeros(x.shape[0], device=x.device)
+
+        total = (
+            self._w_pacs * pacs_photo
+            + self._w_low_edge * low_edge
+            + self._w_texture * texture_richness
+            + self._w_color * color_var
+        )
+
+        details = {
+            "pacs_photo": pacs_photo,
+            "edge_density": density,
+            "low_edge": low_edge,
+            "texture_richness": texture_richness,
+            "color_variance": color_var,
+        }
+        return total, details
+
+
 # Lazy singletons
 _pacs_scorer: _PACSScorer | None = None
 _sketch_scorer: _SketchScorer | None = None
+_realistic_scorer: _RealisticScorer | None = None
 
 
 def get_sketch_scorer() -> _SketchScorer:
@@ -207,6 +343,16 @@ def get_sketch_scorer() -> _SketchScorer:
     if _sketch_scorer is None:
         _sketch_scorer = _SketchScorer(_pacs_scorer)
     return _sketch_scorer
+
+
+def get_realistic_scorer() -> _RealisticScorer:
+    """Get or create the shared realistic scorer singleton."""
+    global _pacs_scorer, _realistic_scorer
+    if _pacs_scorer is None:
+        _pacs_scorer = _PACSScorer()
+    if _realistic_scorer is None:
+        _realistic_scorer = _RealisticScorer(_pacs_scorer)
+    return _realistic_scorer
 
 
 class SketchReward(RewardFunction):

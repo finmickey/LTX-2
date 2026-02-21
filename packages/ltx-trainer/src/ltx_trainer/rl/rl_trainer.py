@@ -82,6 +82,12 @@ class RLTrainer:
         # Load models
         self._load_models()
 
+        # Enable preference conditioning before PEFT wraps the model (pareto mode only)
+        if self._rl_config.preference_mode == "pareto":
+            from .rewards import count_reward_dimensions
+            num_rewards_pred = sum(count_reward_dimensions(rc.type) for rc in self._rl_config.rewards)
+            self._transformer.enable_preference_conditioning(num_rewards_pred)
+
         # Setup accelerator
         self._setup_accelerator()
 
@@ -94,17 +100,31 @@ class RLTrainer:
         # Setup reward functions: list of (RewardFunction, name) tuples
         # video_score expands into one reward per dimension
         self._reward_fns = []
+        self._reward_names = []
         for rc in self._rl_config.rewards:
-            self._reward_fns.extend(get_reward_functions(rc.type))
+            expanded = get_reward_functions(rc.type)
+            self._reward_fns.extend(expanded)
+            if rc.name and len(expanded) == 1:
+                self._reward_names.append(rc.name)
+            else:
+                self._reward_names.extend([name for _, name in expanded])
 
         # Reward metadata for pareto mode
-        self._reward_names = [name for _, name in self._reward_fns]
         reward_weights_list: list[float] = []
         for rc in self._rl_config.rewards:
             expanded = get_reward_functions(rc.type)
             reward_weights_list.extend([rc.weight] * len(expanded))
         self._reward_weights = torch.tensor(reward_weights_list, dtype=torch.float32)
         self._num_rewards = len(self._reward_fns)
+
+        # Verify preference conditioning dimension matches actual rewards
+        if self._rl_config.preference_mode == "pareto":
+            from .rewards import count_reward_dimensions
+            expected = sum(count_reward_dimensions(rc.type) for rc in self._rl_config.rewards)
+            assert self._num_rewards == expected, (
+                f"Reward dimension mismatch: count_reward_dimensions predicted {expected}, "
+                f"but actual reward functions give {self._num_rewards}"
+            )
 
         # Patchifier for unpatchify during decode
         self._video_patchifier = VideoLatentPatchifier(patch_size=1)
@@ -200,8 +220,8 @@ class RLTrainer:
             f"ema_decay={rl_cfg.ema_decay}"
         )
 
-        # Save validation videos at step 0 (before any training), skip on resume
-        if rl_cfg.video_save_interval is not None and self._validation_prompts and resume_step == 0:
+        # Save validation videos at step 0 (before any training)
+        if rl_cfg.video_save_interval is not None and self._validation_prompts:
             self._save_validation_videos(step=0)
 
         self._accelerator.wait_for_everyone()
@@ -261,6 +281,7 @@ class RLTrainer:
                     frame_rate=rl_cfg.frame_rate,
                     seed=gen_seeds,
                     device=device,
+                    preference=pref,
                 )
                 total_gen_time += self._wall_time() - t0
 
@@ -300,7 +321,7 @@ class RLTrainer:
 
                     t0 = self._wall_time()
                     prompt_text = cached.prompt_text
-                    individual = {name: fn.compute(pixel_video, prompt=prompt_text) for fn, name in self._reward_fns}
+                    individual = {rname: fn.compute(pixel_video, prompt=prompt_text) for (fn, _), rname in zip(self._reward_fns, self._reward_names)}
                     reward = sum(individual.values())
                     total_reward_time += self._wall_time() - t0
 
@@ -343,12 +364,12 @@ class RLTrainer:
                 all_prompt_rewards.append(gathered)
 
                 gi: dict[str, Tensor] = {}
-                for _, name in self._reward_fns:
+                for rname in self._reward_names:
                     local_vals = torch.tensor(
-                        [d[name] for d in ps["individual_rewards"]],
+                        [d[rname] for d in ps["individual_rewards"]],
                         device=device, dtype=torch.float32,
                     )
-                    gi[name] = self._accelerator.gather(local_vals)  # [K]
+                    gi[rname] = self._accelerator.gather(local_vals)  # [K]
                 all_gathered_individual.append(gi)
 
             all_flat_rewards = torch.cat(all_prompt_rewards)  # [num_prompts_per_epoch * K]
@@ -389,7 +410,7 @@ class RLTrainer:
                     offset += K
             elif preference_mode == "per_reward_zscore":
                 # Independent per-reward z-score: z-score each reward separately, average into one scalar
-                reward_names = [name for _, name in self._reward_fns]
+                reward_names = self._reward_names
                 R = len(reward_names)
                 K = rl_cfg.num_samples_per_prompt
 
@@ -553,7 +574,13 @@ class RLTrainer:
                     ))
                     all_input_lists.append(input_list)
 
+                # --- Build preference tensor for this micro-batch (pareto mode) ---
+                mb_pref = None
+                if preference_mode == "pareto":
+                    mb_pref = torch.stack([s["preferences"] for s in mb_samples]).to(device)  # (mb_size, R)
+
                 # --- Build mega-modality (all timesteps concatenated along batch dim) ---
+                mega_pref = mb_pref.repeat(num_timesteps, 1) if mb_pref is not None else None
                 mega_modality = Modality(
                     enabled=True,
                     latent=torch.cat([m.latent for m in all_modalities], dim=0),
@@ -572,11 +599,12 @@ class RLTrainer:
                 with torch.no_grad(), torch.autocast(device_type=device_type, dtype=autocast_dtype):
                     v_old_mega, _ = self._transformer(
                         video=mega_modality, audio=None, perturbations=None,
+                        preference=mega_pref,
                     )
                     v_old_all = list(v_old_mega.split(mb_size, dim=0))
                 total_fwd_old += self._wall_time() - t0
 
-                # --- ALL ref fwd passes (mega-batched single pass) ---
+                # --- ALL ref fwd passes (mega-batched, unconditioned baseline) ---
                 unwrapped = self._accelerator.unwrap_model(self._transformer)
                 t0 = self._wall_time()
                 with unwrapped.disable_adapter():
@@ -585,6 +613,7 @@ class RLTrainer:
                     with torch.no_grad(), torch.autocast(device_type=device_type, dtype=autocast_dtype):
                         v_ref_mega, _ = self._transformer(
                             video=mega_modality, audio=None, perturbations=None,
+                            preference=None,
                         )
                         v_ref_all = list(v_ref_mega.split(mb_size, dim=0))
                 total_fwd_ref += self._wall_time() - t0
@@ -607,10 +636,12 @@ class RLTrainer:
                         with torch.autocast(device_type=device_type, dtype=autocast_dtype):
                             v_new_batched, _ = self._transformer(
                                 video=all_modalities[group_indices[0]], audio=None, perturbations=None,
+                                preference=mb_pref,
                             )
                         v_new_chunks = [v_new_batched]
                     else:
                         # Multiple timesteps: cat modalities, single forward, split output
+                        group_pref = mb_pref.repeat(group_size, 1) if mb_pref is not None else None
                         group_modality = Modality(
                             enabled=True,
                             latent=torch.cat([all_modalities[j].latent for j in group_indices], dim=0),
@@ -622,6 +653,7 @@ class RLTrainer:
                         with torch.autocast(device_type=device_type, dtype=autocast_dtype):
                             v_new_mega, _ = self._transformer(
                                 video=group_modality, audio=None, perturbations=None,
+                                preference=group_pref,
                             )
                         v_new_chunks = list(v_new_mega.split(mb_size, dim=0))
                         del v_new_mega, group_modality
@@ -792,10 +824,10 @@ class RLTrainer:
                     log_metrics["rl/neg_loss"] = accumulated_metrics_snapshot.get("neg_loss", 0.0)
 
                 # Aggregate individual rewards across all prompts in epoch
-                for _, name in self._reward_fns:
-                    all_vals = torch.cat([gi[name] for gi in all_gathered_individual])
-                    log_metrics[f"rl/reward/{name}"] = all_vals.mean().item()
-                    log_metrics[f"rl/reward/{name}_std"] = all_vals.std().item() if len(all_vals) > 1 else 0.0
+                for rname in self._reward_names:
+                    all_vals = torch.cat([gi[rname] for gi in all_gathered_individual])
+                    log_metrics[f"rl/reward/{rname}"] = all_vals.mean().item()
+                    log_metrics[f"rl/reward/{rname}_std"] = all_vals.std().item() if len(all_vals) > 1 else 0.0
 
                 # Pareto-specific metrics
                 if preference_mode == "pareto":
@@ -809,6 +841,14 @@ class RLTrainer:
                             key = f"policy_loss_obj_{r_idx}"
                             if key in accumulated_metrics_snapshot:
                                 log_metrics[f"rl/policy_loss/{name}"] = accumulated_metrics_snapshot[key]
+                    # Log preference gate scalar and adaln norm for monitoring conditioning strength
+                    for pname, pparam in self._transformer.named_parameters():
+                        if "pref_gate" in pname and "default" in pname and pparam.numel() == 1:
+                            log_metrics["rl/pref_gate"] = pparam.item()
+                        if "pref_adaln" in pname and "default" in pname and pname.endswith("weight"):
+                            log_metrics["rl/pref_adaln_norm"] = pparam.norm().item()
+                        if "rl/pref_gate" in log_metrics and "rl/pref_adaln_norm" in log_metrics:
+                            break
 
                 for tname, tval in timings.items():
                     log_metrics[f"rl/time/{tname}"] = tval
@@ -816,11 +856,11 @@ class RLTrainer:
 
                 # Build per-reward detail string
                 reward_parts = []
-                for _, name in self._reward_fns:
-                    all_vals = torch.cat([gi[name] for gi in all_gathered_individual])
+                for rname in self._reward_names:
+                    all_vals = torch.cat([gi[rname] for gi in all_gathered_individual])
                     r_mean = all_vals.mean().item()
                     r_std = all_vals.std().item() if len(all_vals) > 1 else 0.0
-                    reward_parts.append(f"{name}: mu={r_mean:.2f} s={r_std:.2f}")
+                    reward_parts.append(f"{rname}: mu={r_mean:.2f} s={r_std:.2f}")
                 reward_detail = " | ".join(reward_parts)
 
                 loss_str = ""
@@ -1012,12 +1052,18 @@ class RLTrainer:
     def _setup_dual_lora(self) -> None:
         """Setup dual LoRA adapters: 'default' (trainable) and 'old' (frozen reference)."""
         lora_cfg = self._config.lora
+
+        # Include preference conditioning modules in per-adapter copies if present
+        has_pref_conditioning = hasattr(self._transformer, "pref_conditioner")
+        modules_to_save = ["pref_conditioner", "pref_gate", "pref_adaln"] if has_pref_conditioning else None
+
         lora_config = LoraConfig(
             r=lora_cfg.rank,
             lora_alpha=lora_cfg.alpha,
             target_modules=lora_cfg.target_modules,
             lora_dropout=lora_cfg.dropout,
             init_lora_weights=True,
+            modules_to_save=modules_to_save,
         )
 
         # Add default adapter
@@ -1029,9 +1075,9 @@ class RLTrainer:
         # Copy default weights to old adapter
         self._sync_old_adapter_from_default()
 
-        # Freeze 'old' adapter parameters
+        # Freeze 'old' adapter parameters (LoRA weights + modules_to_save)
         for name, param in self._transformer.named_parameters():
-            if "old" in name and "lora" in name:
+            if "old" in name and ("lora" in name or "modules_to_save" in name):
                 param.requires_grad_(False)
 
         # Set back to default for initial state
@@ -1071,7 +1117,7 @@ class RLTrainer:
         default_params = {}
         old_params = {}
         for name, param in self._transformer.named_parameters():
-            if "lora" not in name:
+            if "lora" not in name and "modules_to_save" not in name:
                 continue
             if ".default." in name:
                 key = name.replace(".default.", ".ADAPTER.")
@@ -1093,7 +1139,7 @@ class RLTrainer:
         default_params = {}
         old_params = {}
         for name, param in unwrapped.named_parameters():
-            if "lora" not in name:
+            if "lora" not in name and "modules_to_save" not in name:
                 continue
             if ".default." in name:
                 key = name.replace(".default.", ".ADAPTER.")
@@ -1181,12 +1227,32 @@ class RLTrainer:
     # Saving
     # ========================================================================
 
-    def _save_validation_videos(self, step: int) -> None:
-        """Generate and save one validation video per GPU using EMA weights.
+    def _get_validation_preferences(self) -> list[tuple[str, Tensor | None]]:
+        """Build list of (label, preference_tensor) for validation in pareto mode.
 
-        Swaps EMA weights into the default adapter for generation, then restores.
-        Each GPU generates its rank-th validation prompt with a fixed seed,
-        producing files like `samples/step_00000_dog.mp4`.
+        Returns one-hot vectors for each reward dimension plus a uniform vector.
+        Non-pareto modes return a single (empty-label, None) entry.
+        """
+        if self._rl_config.preference_mode != "pareto":
+            return [("", None)]
+
+        R = self._num_rewards
+        prefs: list[tuple[str, Tensor]] = []
+        # One-hot for each reward
+        for i, name in enumerate(self._reward_names):
+            vec = torch.zeros(R)
+            vec[i] = 1.0
+            prefs.append((f"pref_{name}", vec))
+        # Uniform
+        prefs.append(("pref_uniform", torch.ones(R) / R))
+        return prefs
+
+    def _save_validation_videos(self, step: int) -> None:
+        """Generate and save validation videos per GPU using EMA weights.
+
+        In pareto mode, generates one video per preference vector (one-hot per
+        reward + uniform) for each GPU's validation prompt.  Non-pareto mode
+        generates a single video per GPU.
         """
         device = self._accelerator.device
         rank = self._accelerator.process_index
@@ -1203,32 +1269,43 @@ class RLTrainer:
 
         self._set_adapter("default")
 
-        latent, _, _ = generate_video_latent(
-            transformer=self._transformer,
-            video_prompt_embeds=video_prompt_embeds,
-            num_frames=rl_cfg.generation_num_frames,
-            height=rl_cfg.generation_height,
-            width=rl_cfg.generation_width,
-            num_steps=rl_cfg.generation_steps,
-            frame_rate=rl_cfg.frame_rate,
-            seed=42,
-            device=device,
-        )
-        pixel_video = self._decode_latent_to_pixels(latent, device)
+        output_dir = Path(self._config.output_dir) / "samples"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        val_prefs = self._get_validation_preferences()
+        saved_names: list[str] = []
+
+        for pref_label, pref_vec in val_prefs:
+            pref = pref_vec.to(device) if pref_vec is not None else None
+
+            latent, _, _ = generate_video_latent(
+                transformer=self._transformer,
+                video_prompt_embeds=video_prompt_embeds,
+                num_frames=rl_cfg.generation_num_frames,
+                height=rl_cfg.generation_height,
+                width=rl_cfg.generation_width,
+                num_steps=rl_cfg.generation_steps,
+                frame_rate=rl_cfg.frame_rate,
+                seed=42,
+                device=device,
+                preference=pref,
+            )
+            pixel_video = self._decode_latent_to_pixels(latent, device)
+
+            suffix = f"_{pref_label}" if pref_label else ""
+            output_path = output_dir / f"step_{step:05d}_{vp.nickname}{suffix}.mp4"
+            save_video(video_tensor=pixel_video, output_path=output_path, fps=rl_cfg.frame_rate)
+            saved_names.append(output_path.name)
+
+            del pixel_video, latent
 
         # Restore original weights
         if self._ema is not None and self._trainable_params is not None:
             self._ema.restore(self._trainable_params)
 
-        output_dir = Path(self._config.output_dir) / "samples"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"step_{step:05d}_{vp.nickname}.mp4"
-        save_video(video_tensor=pixel_video, output_path=output_path, fps=rl_cfg.frame_rate)
-
-        del pixel_video, latent
         free_gpu_memory()
 
-        logger.info(f"Saved validation video: {output_path.name}")
+        logger.info(f"Saved validation videos: {', '.join(saved_names)}")
         self._accelerator.wait_for_everyone()
 
     def _generate_validation_grid(self, step: int) -> None:
@@ -1356,6 +1433,15 @@ class RLTrainer:
         Must be called after dual LoRA setup, accelerator.prepare(optimizer),
         and EMA init.
 
+        Supports two checkpoint formats:
+        - .pt file: full training state (adapters, optimizer, EMA, counters)
+        - directory: finds latest .pt file in the directory
+
+        When the checkpoint comes from a run with different trainable params
+        (e.g. non-pareto → pareto, which adds pref_conditioner/pref_gate),
+        adapter LoRA weights are loaded and new layers keep their init values.
+        Optimizer and EMA state are skipped if param counts don't match.
+
         Args:
             checkpoint_path: Path to .pt file or checkpoint directory.
             optimizer: The prepared optimizer to restore state into.
@@ -1377,18 +1463,44 @@ class RLTrainer:
 
         unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
 
-        # Restore default adapter
-        set_peft_model_state_dict(unwrapped, state["default_adapter"], adapter_name="default")
+        # Restore adapters. Pad checkpoint state dicts with current model values
+        # for any new keys (e.g. pref_conditioner/pref_gate added by pareto mode)
+        # so that PEFT doesn't error on missing keys.
+        for adapter_name, state_key in [("default", "default_adapter"), ("old", "old_adapter")]:
+            current = get_peft_model_state_dict(unwrapped, adapter_name=adapter_name)
+            ckpt = state[state_key]
+            merged = {k: v.cpu().clone() for k, v in current.items()}
+            loaded_keys = []
+            for k, v in ckpt.items():
+                if k in merged:
+                    merged[k] = v
+                    loaded_keys.append(k)
+            skipped = set(merged.keys()) - set(loaded_keys)
+            if skipped:
+                logger.info(
+                    f"Adapter '{adapter_name}': loaded {len(loaded_keys)} keys, "
+                    f"kept init for {len(skipped)} new keys: {sorted(skipped)[:5]}..."
+                )
+            set_peft_model_state_dict(unwrapped, merged, adapter_name=adapter_name)
 
-        # Restore old adapter
-        set_peft_model_state_dict(unwrapped, state["old_adapter"], adapter_name="old")
+        # Restore optimizer state (may fail if trainable param count changed)
+        try:
+            optimizer.load_state_dict(state["optimizer"])
+        except (ValueError, KeyError) as e:
+            logger.warning(
+                f"Could not restore optimizer state (param count likely changed): {e}. "
+                f"Continuing with fresh optimizer."
+            )
 
-        # Restore optimizer state
-        optimizer.load_state_dict(state["optimizer"])
-
-        # Restore EMA state
+        # Restore EMA state (may fail if trainable param count changed)
         if self._ema is not None and state.get("ema") is not None:
-            self._ema.load_state_dict(state["ema"])
+            try:
+                self._ema.load_state_dict(state["ema"])
+            except (ValueError, KeyError, RuntimeError) as e:
+                logger.warning(
+                    f"Could not restore EMA state (param count likely changed): {e}. "
+                    f"Continuing with fresh EMA."
+                )
 
         global_step = state["global_step"]
         epoch = state["epoch"]

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from enum import Enum
 
 import torch
@@ -15,6 +16,68 @@ from ltx_core.model.transformer.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from ltx_core.utils import to_denoised
+
+
+class PreferenceConditioner(torch.nn.Module):
+    """MLP that projects a preference vector (B, R) to the timestep embedding space (B, D).
+
+    Output initialized near-zero so the model starts as unconditional.
+    """
+
+    def __init__(self, preference_dim: int, inner_dim: int) -> None:
+        super().__init__()
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(preference_dim, inner_dim),
+            torch.nn.SiLU(),
+            torch.nn.Linear(inner_dim, inner_dim),
+        )
+        # Near-zero output init so conditioning is identity at step 0
+        with torch.no_grad():
+            self.mlp[2].weight.normal_(std=1e-3)
+            self.mlp[2].bias.zero_()
+
+    def forward(self, preference: torch.Tensor) -> torch.Tensor:
+        return self.mlp(preference)
+
+
+class PreferenceGate(torch.nn.Module):
+    """Learnable scalar gate for preference conditioning.
+
+    Wrapped as nn.Module (not raw Parameter) so PEFT modules_to_save
+    creates per-adapter copies for dual-adapter LoRA training.
+
+    forward() accepts an optional dummy argument because PEFT's
+    AuxiliaryTrainingWrapper.forward(x) requires at least one positional arg.
+    """
+
+    def __init__(self, init_value: float = 1e-3) -> None:
+        super().__init__()
+        self.g = torch.nn.Parameter(torch.tensor(init_value))
+
+    def forward(self, x: torch.Tensor | None = None) -> torch.Tensor:
+        return self.g
+
+
+class PrefAdaLN(torch.nn.Module):
+    """Post-block AdaLN: preference → scale+shift applied after norm_out, before proj_out.
+
+    Direct late-stage preference conditioning (Path B from ParetoNFT).
+    """
+
+    def __init__(self, preference_dim: int, inner_dim: int) -> None:
+        super().__init__()
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(preference_dim, inner_dim),
+            torch.nn.SiLU(),
+            torch.nn.Linear(inner_dim, inner_dim * 2),
+        )
+        with torch.no_grad():
+            self.mlp[2].weight.normal_(std=1e-4)
+            self.mlp[2].bias.zero_()
+
+    def forward(self, preference: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        out = self.mlp(preference)
+        return out.chunk(2, dim=-1)  # (scale, shift)
 
 
 class LTXModelType(Enum):
@@ -313,6 +376,19 @@ class LTXModel(torch.nn.Module):
             ]
         )
 
+    def enable_preference_conditioning(self, preference_dim: int) -> None:
+        """Attach preference conditioning modules to inject into the timestep embedding.
+
+        Must be called BEFORE PEFT wraps the model so that modules_to_save
+        can create per-adapter copies.
+
+        Args:
+            preference_dim: Number of reward dimensions (R) in the preference vector.
+        """
+        self.pref_conditioner = PreferenceConditioner(preference_dim, self.inner_dim)
+        self.pref_gate = PreferenceGate(init_value=1e-3)
+        self.pref_adaln = PrefAdaLN(preference_dim, self.inner_dim)
+
     def set_gradient_checkpointing(self, enable: bool) -> None:
         """Enable or disable gradient checkpointing for transformer blocks.
         Gradient checkpointing trades compute for memory by recomputing activations
@@ -360,6 +436,8 @@ class LTXModel(torch.nn.Module):
         proj_out: torch.nn.Linear,
         x: torch.Tensor,
         embedded_timestep: torch.Tensor,
+        pref_scale: torch.Tensor | None = None,
+        pref_shift: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Process output for LTXV."""
         # Apply scale-shift modulation
@@ -370,14 +448,30 @@ class LTXModel(torch.nn.Module):
 
         x = norm_out(x)
         x = x * (1 + scale) + shift
+        # Path B: post-block AdaLN preference conditioning
+        if pref_scale is not None:
+            x = x * (1 + pref_scale) + pref_shift
         x = proj_out(x)
         return x
 
     def forward(
-        self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig
+        self,
+        video: Modality | None,
+        audio: Modality | None,
+        perturbations: BatchedPerturbationConfig,
+        preference: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for LTX models.
+
+        Args:
+            video: Video modality input.
+            audio: Audio modality input.
+            perturbations: Perturbation configuration.
+            preference: Optional preference vector (B, R) for conditional ParetoNFT.
+                When provided and pref_conditioner exists, injects into the timestep
+                embedding so the model can steer generation toward a reward trade-off.
+
         Returns:
             Processed output tensors
         """
@@ -388,6 +482,15 @@ class LTXModel(torch.nn.Module):
 
         video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
         audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
+
+        # Inject preference conditioning into the video timestep embedding
+        if preference is not None and video_args is not None and hasattr(self, "pref_conditioner"):
+            pref = preference.to(device=video_args.embedded_timestep.device, dtype=video_args.embedded_timestep.dtype)
+            pref_emb = self.pref_gate(pref) * self.pref_conditioner(pref)  # (B, D)
+            modified_emb = video_args.embedded_timestep + pref_emb.unsqueeze(1)  # (B, seq_len, D)
+            new_timesteps = self.adaln_single.linear(self.adaln_single.silu(modified_emb))  # (B, seq_len, 6*D)
+            video_args = replace(video_args, timesteps=new_timesteps, embedded_timestep=modified_emb)
+
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(
             video=video_args,
@@ -395,10 +498,19 @@ class LTXModel(torch.nn.Module):
             perturbations=perturbations,
         )
 
+        # Path B: compute post-block AdaLN scale/shift from preference
+        pref_scale = pref_shift = None
+        if preference is not None and hasattr(self, "pref_adaln") and video_out is not None:
+            pref_b = preference.to(device=video_out.x.device, dtype=video_out.x.dtype)
+            pref_scale, pref_shift = self.pref_adaln(pref_b)
+            pref_scale = pref_scale.unsqueeze(1)  # (B, 1, D) for broadcasting
+            pref_shift = pref_shift.unsqueeze(1)
+
         # Process output
         vx = (
             self._process_output(
-                self.scale_shift_table, self.norm_out, self.proj_out, video_out.x, video_out.embedded_timestep
+                self.scale_shift_table, self.norm_out, self.proj_out, video_out.x, video_out.embedded_timestep,
+                pref_scale=pref_scale, pref_shift=pref_shift,
             )
             if video_out is not None
             else None
@@ -461,13 +573,14 @@ class X0Model(torch.nn.Module):
         video: Modality | None,
         audio: Modality | None,
         perturbations: BatchedPerturbationConfig,
+        preference: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
         Denoise the video and audio according to the sigma.
         Returns:
             Denoised video and audio
         """
-        vx, ax = self.velocity_model(video, audio, perturbations)
+        vx, ax = self.velocity_model(video, audio, perturbations, preference=preference)
         denoised_video = to_denoised(video.latent, vx, video.timesteps) if vx is not None else None
         denoised_audio = to_denoised(audio.latent, ax, audio.timesteps) if ax is not None else None
         return denoised_video, denoised_audio
