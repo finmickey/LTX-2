@@ -2,9 +2,13 @@
 
 ## Running Training
 
+Always launch training in a **detached tmux session**:
 ```bash
-uv run --no-sync accelerate launch --num_processes 8 \
-  packages/ltx-trainer/scripts/rl_train.py configs/<config_name>.yaml
+mkdir -p outputs/<run_name>
+tmux new-session -d -s <session_name> \
+  "uv run --no-sync accelerate launch --num_processes 8 \
+  packages/ltx-trainer/scripts/rl_train.py configs/<config_name>.yaml \
+  2>&1 | tee outputs/<run_name>/run.log"
 ```
 
 Always use `uv run --no-sync` (pypi.nvidia.com is flaky, skip sync).
