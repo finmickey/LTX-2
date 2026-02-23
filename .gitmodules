@@ -4,3 +4,6 @@
 [submodule "ParetoNFT"]
 	path = ParetoNFT
 	url = https://github.com/Shelley-Golan/ParetoNFT
+[submodule "ParetoControl"]
+	path = ParetoControl
+	url = https://github.com/Shelley-Golan/ParetoControl.git

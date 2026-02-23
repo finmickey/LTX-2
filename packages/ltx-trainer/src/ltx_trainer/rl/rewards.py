@@ -587,6 +587,8 @@ _clip_score_model: _ClipScoreModel | None = None
 _pickscore_model: _PickScoreModel | None = None
 _video_score2_model: object | None = None
 _unifiedreward_think_model: object | None = None
+_vlm_dual_style_models: object | None = None
+_vlm_combined_style_model: object | None = None
 
 
 def count_reward_dimensions(reward_type: str) -> int:
@@ -599,6 +601,7 @@ def count_reward_dimensions(reward_type: str) -> int:
         "video_score": 5,
         "video_score2": 3,
         "unifiedreward_think": 3,
+        "vlm_style_dual": 2,
     }
     return _REWARD_DIMENSIONS.get(reward_type, 1)
 
@@ -616,7 +619,7 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
     Returns:
         List of (RewardFunction, display_name) tuples.
     """
-    global _video_score_model, _clip_score_model, _pickscore_model, _video_score2_model, _unifiedreward_think_model
+    global _video_score_model, _clip_score_model, _pickscore_model, _video_score2_model, _unifiedreward_think_model, _vlm_dual_style_models, _vlm_combined_style_model
 
     if name == "video_score":
         if _video_score_model is None:
@@ -696,6 +699,34 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
             _pickscore_model = _PickScoreModel()
         return [(RealisticPickScoreReward(_pickscore_model), "realistic_pickscore")]
 
+    if name == "vlm_realistic":
+        from ltx_trainer.rl.rewards_vlm_style import VLMRealisticReward, _VLMDualStyleModels
+
+        if _vlm_dual_style_models is None:
+            _vlm_dual_style_models = _VLMDualStyleModels()
+        return [(VLMRealisticReward(_vlm_dual_style_models), "vlm_realistic")]
+
+    if name == "vlm_watercolor":
+        from ltx_trainer.rl.rewards_vlm_style import VLMWatercolorReward, _VLMDualStyleModels
+
+        if _vlm_dual_style_models is None:
+            _vlm_dual_style_models = _VLMDualStyleModels()
+        return [(VLMWatercolorReward(_vlm_dual_style_models), "vlm_watercolor")]
+
+    if name == "vlm_style_dual":
+        from ltx_trainer.rl.rewards_vlm_style import (
+            VLMCombinedRealisticReward,
+            VLMCombinedWatercolorReward,
+            _VLMCombinedStyleModel,
+        )
+
+        if _vlm_combined_style_model is None:
+            _vlm_combined_style_model = _VLMCombinedStyleModel()
+        return [
+            (VLMCombinedRealisticReward(_vlm_combined_style_model), "vlm_realistic"),
+            (VLMCombinedWatercolorReward(_vlm_combined_style_model), "vlm_watercolor"),
+        ]
+
     reward_classes: dict[str, type[RewardFunction]] = {
         "redness": RednessReward,
         "blueness": BluenessReward,
@@ -714,6 +745,7 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
             "sketch", "sketch_plus_clip", "realistic_clip", "realistic_plus_clip",
             "sketch_plus_pickscore", "realistic_plus_pickscore",
             "pickscore", "realistic_pickscore",
+            "vlm_realistic", "vlm_watercolor", "vlm_style_dual",
         ]
         raise ValueError(f"Unknown reward function: {name}. Available: {available}")
 

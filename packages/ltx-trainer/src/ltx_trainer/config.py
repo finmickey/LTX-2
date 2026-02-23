@@ -535,6 +535,15 @@ class RLConfig(ConfigBaseModel):
         "and per-prompt per-channel z-score normalization.",
     )
 
+    num_pref_per_prompt: int = Field(
+        default=1,
+        description="Number of distinct preference vectors per prompt in pareto mode. "
+        "When > 1, K samples per prompt are split into sub-groups, each targeting a "
+        "different Pareto front direction. num_samples_per_prompt must be divisible by "
+        "this value, and each sub-group must have >= 2 samples for z-score normalization.",
+        ge=1,
+    )
+
     nft_beta: float = Field(
         default=1.0,
         description="NFT interpolation weight. Controls positive/negative prediction mix and policy loss scaling. Original paper uses 1.0 (default) or 0.1.",
@@ -543,8 +552,8 @@ class RLConfig(ConfigBaseModel):
     )
 
     kl_beta: float = Field(
-        default=0.0001,
-        description="KL regularization weight. Reference DiffusionNFT uses 0.0001.",
+        default=0.1,
+        description="KL regularization weight.",
         ge=0,
     )
 
@@ -691,6 +700,27 @@ class RLConfig(ConfigBaseModel):
         if v is not None and not Path(v).exists():
             raise ValueError(f"Validation prompts file does not exist: {v}")
         return v
+
+    @model_validator(mode="after")
+    def validate_num_pref_per_prompt(self) -> "RLConfig":
+        if self.num_pref_per_prompt > 1:
+            if self.preference_mode != "pareto":
+                raise ValueError(
+                    f"num_pref_per_prompt > 1 requires preference_mode='pareto', "
+                    f"got '{self.preference_mode}'"
+                )
+            if self.num_samples_per_prompt % self.num_pref_per_prompt != 0:
+                raise ValueError(
+                    f"num_samples_per_prompt ({self.num_samples_per_prompt}) must be divisible by "
+                    f"num_pref_per_prompt ({self.num_pref_per_prompt})"
+                )
+            sub_group_size = self.num_samples_per_prompt // self.num_pref_per_prompt
+            if sub_group_size < 2:
+                raise ValueError(
+                    f"Sub-group size {sub_group_size} too small (need >= 2 for z-score). "
+                    f"Reduce num_pref_per_prompt or increase num_samples_per_prompt."
+                )
+        return self
 
 
 class LtxTrainerConfig(ConfigBaseModel):

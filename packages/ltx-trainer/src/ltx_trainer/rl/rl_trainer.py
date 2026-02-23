@@ -51,7 +51,7 @@ from .ema import EMAWrapper
 from .embedding_store import LazyEmbeddingStore
 from .generation import generate_video_latent
 from .nft_loss import compute_nft_loss, compute_per_objective_nft_loss
-from .preference_sampling import sample_preference_for_prompt
+from .preference_sampling import sample_preference_for_prompt, sample_preferences_with_subgroups
 from .rewards import get_reward_functions
 from .stat_tracker import compute_pareto_advantages
 
@@ -217,8 +217,15 @@ class RLTrainer:
             f"T={rl_cfg.num_timesteps_per_sample} timesteps/sample, "
             f"prompts/epoch={num_prompts_per_epoch}, "
             f"grad_accum={grad_accum_steps}, "
-            f"ema_decay={rl_cfg.ema_decay}"
+            f"ema_decay={rl_cfg.ema_decay}, "
+            f"num_pref_per_prompt={rl_cfg.num_pref_per_prompt}"
         )
+        if rl_cfg.num_pref_per_prompt > 1:
+            sub_group_size = rl_cfg.num_samples_per_prompt // rl_cfg.num_pref_per_prompt
+            logger.info(
+                f"Multi-preference: {rl_cfg.num_pref_per_prompt} preferences per prompt, "
+                f"{sub_group_size} samples per sub-group for GDPO normalization"
+            )
 
         # Save validation videos at step 0 (before any training)
         if rl_cfg.video_save_interval is not None and self._validation_prompts:
@@ -256,12 +263,31 @@ class RLTrainer:
                 cached = self._cached_prompt_embeddings[prompt_idx]
                 video_prompt_embeds = cached.video_context_positive.to(device)
 
-                # Sample preference vector BEFORE generation (for future model conditioning)
-                pref = None
+                # Sample preference vectors BEFORE generation (for model conditioning)
+                pref = None  # (R,) single pref or None
+                all_prefs = None  # (K, R) per-sample prefs or None
+                pref_slots = None  # (K,) slot indices or None
+                num_pref_per_prompt = rl_cfg.num_pref_per_prompt
+
                 if preference_mode == "pareto":
-                    pref = sample_preference_for_prompt(
-                        cached.prompt_text, self._num_rewards, cfg.seed, epoch, prompt_cycle_idx - 1,
-                    )  # (R,) tensor
+                    if num_pref_per_prompt > 1:
+                        # Multi-pref: K distinct preferences cycled across all samples
+                        all_prefs_full, pref_slots_full = sample_preferences_with_subgroups(
+                            cached.prompt_text, self._num_rewards, num_pref_per_prompt,
+                            rl_cfg.num_samples_per_prompt, cfg.seed, epoch,
+                        )  # (num_samples_per_prompt, R) and (num_samples_per_prompt,)
+                        # This GPU's slice
+                        local_start = rank * samples_per_gpu
+                        local_end = local_start + samples_per_gpu
+                        all_prefs = all_prefs_full[local_start:local_end]  # (samples_per_gpu, R)
+                        pref_slots = pref_slots_full  # keep full for gathering later
+                        # For generation: pass per-sample preferences (samples_per_gpu, R)
+                        pref = all_prefs  # will be (B, R) in generate_video_latent
+                    else:
+                        # Single pref: all K repeats share the same preference
+                        pref = sample_preference_for_prompt(
+                            cached.prompt_text, self._num_rewards, cfg.seed, epoch, prompt_cycle_idx - 1,
+                        )  # (R,) tensor
 
                 gen_seed_base = (
                     epoch * num_prompts_per_epoch * num_processes * samples_per_gpu
@@ -342,7 +368,9 @@ class RLTrainer:
                     "prompt_idx": prompt_idx,
                     "gen_sigmas": gen_sigmas,
                     "prompt_text": cached.prompt_text,
-                    "preferences": pref,  # (R,) tensor or None
+                    "preferences": pref,  # (R,) or (B, R) tensor or None
+                    "all_prefs": all_prefs,  # (samples_per_gpu, R) or None (multi-pref)
+                    "pref_slots": pref_slots,  # (K,) full or None (multi-pref)
                 })
 
             timings["generation"] = total_gen_time
@@ -380,21 +408,34 @@ class RLTrainer:
             per_prompt_preferences: list[Tensor] = []  # pareto: list of (K, R)
 
             if preference_mode == "pareto":
-                # Build reward_vectors (N_total, R) and prompt_indices from gathered individual rewards
+                # Build reward_vectors (N_total, R) and group keys from gathered individual rewards
+                # Matching ParetoControl: NO reward weight multiplication on raw rewards.
+                # Weights are not used in per-objective mode (preferences drive weighting).
                 K = rl_cfg.num_samples_per_prompt
+                num_pref_pp = rl_cfg.num_pref_per_prompt
                 reward_vectors_list = []
-                prompt_indices_list: list[int] = []
+                group_keys_list: list = []
+
                 for p_idx, gi in enumerate(all_gathered_individual):
                     # gi[name] is (K,) for each reward name
                     prompt_reward_vec = torch.stack([gi[name] for name in self._reward_names], dim=1)  # (K, R)
-                    # Apply reward weights
-                    prompt_reward_vec = prompt_reward_vec * self._reward_weights.to(device)
                     reward_vectors_list.append(prompt_reward_vec)
-                    prompt_indices_list.extend([p_idx] * K)
+
+                    # Build group keys: composite (prompt__prefSlot) for multi-pref, else prompt index
+                    if num_pref_pp > 1:
+                        ps = epoch_samples[p_idx]
+                        # Gather pref_slots across GPUs to get full (K,) slots
+                        local_slots = ps["pref_slots"][rank * samples_per_gpu:(rank + 1) * samples_per_gpu]
+                        local_slots_t = local_slots.to(device)
+                        gathered_slots = self._accelerator.gather(local_slots_t)  # (K,)
+                        for slot_val in gathered_slots.tolist():
+                            group_keys_list.append(f"{p_idx}__pref{int(slot_val)}")
+                    else:
+                        group_keys_list.extend([p_idx] * K)
 
                 reward_vectors = torch.cat(reward_vectors_list, dim=0)  # (N_total, R)
                 all_advantages_per_obj = compute_pareto_advantages(
-                    reward_vectors, prompt_indices_list, rl_cfg.adv_clip_max,
+                    reward_vectors, group_keys_list,
                 )  # (N_total, R)
 
                 # Build per-prompt structures
@@ -402,9 +443,17 @@ class RLTrainer:
                 for p_idx, ps in enumerate(epoch_samples):
                     prompt_advs_obj = all_advantages_per_obj[offset:offset + K]  # (K, R)
                     per_prompt_advantages_per_obj.append(prompt_advs_obj)
-                    # Expand preference (R,) to (K, R) — all K repeats share same preference
-                    pref_expanded = ps["preferences"].unsqueeze(0).expand(K, -1).to(device)
+
+                    # Build per-sample preferences (K, R)
+                    if num_pref_pp > 1:
+                        # Multi-pref: gather per-sample preferences across GPUs
+                        local_prefs = ps["all_prefs"].to(device)  # (samples_per_gpu, R)
+                        pref_expanded = self._accelerator.gather(local_prefs)  # (K, R)
+                    else:
+                        # Single pref: expand (R,) to (K, R)
+                        pref_expanded = ps["preferences"].unsqueeze(0).expand(K, -1).to(device)
                     per_prompt_preferences.append(pref_expanded)
+
                     # Legacy scalar advantages not used in pareto mode, but fill for logging
                     per_prompt_advantages.append([0.5] * K)
                     offset += K
