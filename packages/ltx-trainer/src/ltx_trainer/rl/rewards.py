@@ -480,6 +480,32 @@ class RealisticPlusClipReward(RewardFunction):
         return realistic_raw + clip_raw
 
 
+class URRealisticPlusClipReward(RewardFunction):
+    """Sum of UR realistic style score [0,1] and raw CLIP cosine similarity ~[0.15, 0.40]."""
+
+    def __init__(self, style_model: object, clip_model: _ClipScoreModel) -> None:
+        self._style_model = style_model
+        self._clip_model = clip_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        ur_score = self._style_model.get_score(video, prompt, "realistic")
+        clip_raw = self._clip_model.compute_raw_similarity(video, prompt)
+        return ur_score + clip_raw
+
+
+class URPixarPlusClipReward(RewardFunction):
+    """Sum of UR Pixar style score [0,1] and raw CLIP cosine similarity ~[0.15, 0.40]."""
+
+    def __init__(self, style_model: object, clip_model: _ClipScoreModel) -> None:
+        self._style_model = style_model
+        self._clip_model = clip_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        ur_score = self._style_model.get_score(video, prompt, "pixar")
+        clip_raw = self._clip_model.compute_raw_similarity(video, prompt)
+        return ur_score + clip_raw
+
+
 class _PickScoreModel:
     """Shared PickScore model for text-image preference scoring (loaded once, kept on GPU)."""
 
@@ -752,6 +778,26 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
         cls, display_name = _ur_reward_map[name]
         return [(cls(_ur_style_model), display_name)]
 
+    if name in ("ur_realistic_plus_clip", "ur_pixar_plus_clip"):
+        from ltx_trainer.rl.rewards_ur_style import _URStyleModel
+
+        if _ur_style_model is None:
+            if _unifiedreward_think_model is not None:
+                _ur_style_model = _URStyleModel(
+                    model=_unifiedreward_think_model._model,
+                    processor=_unifiedreward_think_model._processor,
+                )
+            else:
+                _ur_style_model = _URStyleModel()
+        if _clip_score_model is None:
+            _clip_score_model = _ClipScoreModel()
+        _ur_clip_map = {
+            "ur_realistic_plus_clip": (URRealisticPlusClipReward, "ur_realistic_plus_clip"),
+            "ur_pixar_plus_clip": (URPixarPlusClipReward, "ur_pixar_plus_clip"),
+        }
+        cls, display_name = _ur_clip_map[name]
+        return [(cls(_ur_style_model, _clip_score_model), display_name)]
+
     reward_classes: dict[str, type[RewardFunction]] = {
         "redness": RednessReward,
         "blueness": BluenessReward,
@@ -772,6 +818,7 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
             "pickscore", "realistic_pickscore",
             "vlm_realistic", "vlm_watercolor", "vlm_pixar",
             "ur_realistic", "ur_watercolor", "ur_pixar",
+            "ur_realistic_plus_clip", "ur_pixar_plus_clip",
         ]
         raise ValueError(f"Unknown reward function: {name}. Available: {available}")
 
