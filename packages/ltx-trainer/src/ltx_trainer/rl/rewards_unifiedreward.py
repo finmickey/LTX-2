@@ -17,7 +17,7 @@ import torch
 from PIL import Image
 from torch import Tensor
 
-from ltx_trainer.rl.rewards import RewardFunction
+from ltx_trainer.rl.rewards import RewardFunction, _video_content_hash
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +46,13 @@ class _UnifiedRewardThinkModel:
             .to("cuda")
         )
 
-        # Cache for storing computed scores by video object id
-        self._cache_key: int | None = None
-        self._cache_scores: dict[str, float] | None = None
+        # Fix cuDNN pathological Conv3d performance in Qwen3-VL vision encoder
+        from ltx_trainer.rl.rewards_ur_style import _patch_conv3d_as_linear
 
-        # Batch cache: filled by precompute_batch(), keyed by id(video_tensor)
-        self._batch_cache: dict[int, dict[str, float]] = {}
+        _patch_conv3d_as_linear(self._model)
+
+        self._cache_key: bytes | None = None
+        self._cache_scores: dict[str, float] | None = None
 
     @staticmethod
     def _sample_frames(video: Tensor, num_frames: int = NUM_FRAMES) -> list[Image.Image]:
@@ -74,30 +75,14 @@ class _UnifiedRewardThinkModel:
         return frames
 
     def get_dimension_score(self, video: Tensor, prompt: str, dimension: str) -> float:
-        """Get score for a specific dimension, computing all scores on first call per video.
-
-        Args:
-            video: Video tensor [C, F, H, W] in [0, 1] range
-            prompt: Text prompt used to generate the video
-            dimension: One of DIMENSIONS
-
-        Returns:
-            Score for the requested dimension (1.0 to 5.0 scale)
-        """
+        """Get score for a specific dimension, computing all on first call per video."""
         if dimension not in self.DIMENSIONS:
             raise ValueError(f"Invalid dimension: {dimension}. Must be one of {self.DIMENSIONS}")
 
-        vid_key = id(video)
-
-        # Check batch cache first (filled by precompute_batch)
-        if vid_key in self._batch_cache:
-            return self._batch_cache[vid_key][dimension]
-
-        # Fallback to single-video computation
-        if self._cache_key != vid_key:
+        key = _video_content_hash(video)
+        if key != self._cache_key:
             self._cache_scores = self._compute_all(video, prompt)
-            self._cache_key = vid_key
-
+            self._cache_key = key
         return self._cache_scores[dimension]
 
     def _build_messages(self, frames: list[Image.Image], prompt: str) -> list[dict]:
@@ -138,19 +123,17 @@ class _UnifiedRewardThinkModel:
 
         return self._parse_output(output_text)
 
-    def precompute_batch(self, videos: list[Tensor], prompts: list[str]) -> None:
+    def compute_batch(self, videos: list[Tensor], prompts: list[str]) -> list[dict[str, float]]:
         """Batch-compute scores for multiple videos in one generate() call.
 
-        Results are stored in _batch_cache keyed by id(video_tensor).
-        Subsequent get_dimension_score() calls will read from this cache.
+        Returns:
+            List of score dicts, one per video.
         """
-        self._batch_cache.clear()
         n = len(videos)
         if n == 0:
-            return
+            return []
         if n == 1:
-            self._batch_cache[id(videos[0])] = self._compute_all(videos[0], prompts[0])
-            return
+            return [self._compute_all(videos[0], prompts[0])]
 
         all_texts: list[str] = []
         all_images: list[Image.Image] = []
@@ -180,8 +163,7 @@ class _UnifiedRewardThinkModel:
                 output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
             )
 
-        for video, text in zip(videos, output_texts):
-            self._batch_cache[id(video)] = self._parse_output(text)
+        return [self._parse_output(text) for text in output_texts]
 
     def _build_evaluation_prompt(self, text_prompt: str) -> str:
         """Build the evaluation prompt for UnifiedReward.
@@ -289,6 +271,6 @@ class UnifiedRewardThinkDimensionReward(RewardFunction):
         """
         return self._model.get_dimension_score(video, prompt, self._dimension)
 
-    def precompute_batch(self, videos: list[Tensor], prompts: list[str]) -> None:
-        """Batch-precompute scores for multiple videos (delegates to shared model)."""
-        self._model.precompute_batch(videos, prompts)
+    def compute_batch(self, videos: list[Tensor], prompts: list[str]) -> list[dict[str, float]]:
+        """Batch-compute scores for multiple videos (delegates to shared model)."""
+        return self._model.compute_batch(videos, prompts)

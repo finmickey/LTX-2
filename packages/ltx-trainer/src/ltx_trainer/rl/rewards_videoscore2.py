@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 from torch import Tensor
 
-from ltx_trainer.rl.rewards import RewardFunction
+from ltx_trainer.rl.rewards import RewardFunction, _video_content_hash
 from ltx_trainer.video_utils import save_video
 
 logger = logging.getLogger(__name__)
@@ -47,30 +47,18 @@ class _VideoScore2Model:
         )
         self._process_vision_info = process_vision_info
         self._fps = fps
-
-        # Cache for storing computed scores by video object id
-        self._cache_key: int | None = None
+        self._cache_key: bytes | None = None
         self._cache_scores: dict[str, float] | None = None
 
     def get_dimension_score(self, video: Tensor, prompt: str, dimension: str) -> float:
-        """Get score for a specific dimension, computing all scores on first call per video.
-
-        Args:
-            video: Video tensor [C, F, H, W] in [0, 1] range
-            prompt: Text prompt used to generate the video
-            dimension: One of DIMENSIONS
-
-        Returns:
-            Score for the requested dimension (1.0 to 5.0 scale)
-        """
+        """Get score for a specific dimension, computing all on first call per video."""
         if dimension not in self.DIMENSIONS:
             raise ValueError(f"Invalid dimension: {dimension}. Must be one of {self.DIMENSIONS}")
 
-        vid_key = id(video)
-        if self._cache_key != vid_key:
+        key = _video_content_hash(video)
+        if key != self._cache_key:
             self._cache_scores = self._compute_all(video, prompt)
-            self._cache_key = vid_key
-
+            self._cache_key = key
         return self._cache_scores[dimension]
 
     def _compute_all(self, video: Tensor, prompt: str) -> dict[str, float]:

@@ -17,6 +17,19 @@ logger = logging.getLogger(__name__)
 _logged_shapes = False
 
 
+def _video_content_hash(video: Tensor) -> bytes:
+    """Fast content-based hash key for a video tensor.
+
+    Samples ~1024 evenly-spaced values from the flattened tensor and returns
+    their raw bytes.  This is O(1) in video size and collision-free in practice
+    (two videos that differ in even a single pixel will almost certainly differ
+    in at least one of the 1024 sampled positions).
+    """
+    flat = video.flatten()
+    stride = max(1, len(flat) // 1024)
+    return flat[::stride].numpy().tobytes()
+
+
 class RewardFunction(ABC):
     """Abstract base class for reward functions."""
 
@@ -287,15 +300,15 @@ class _VideoScoreModel:
             .to("cuda")
         )
         self._max_num_frames = max_num_frames
-        self._cache_key: int | None = None
+        self._cache_key: bytes | None = None
         self._cache_scores: list[float] | None = None
 
     def get_dimension_score(self, video: Tensor, prompt: str, dim_idx: int) -> float:
-        """Get score for a specific dimension, computing all scores on first call per video."""
-        vid_key = id(video)
-        if self._cache_key != vid_key:
+        """Get score for a specific dimension, computing all on first call per video."""
+        key = _video_content_hash(video)
+        if key != self._cache_key:
             self._cache_scores = self._compute_all(video, prompt)
-            self._cache_key = vid_key
+            self._cache_key = key
         return self._cache_scores[dim_idx]
 
     def _compute_all(self, video: Tensor, prompt: str) -> list[float]:
@@ -588,7 +601,7 @@ _pickscore_model: _PickScoreModel | None = None
 _video_score2_model: object | None = None
 _unifiedreward_think_model: object | None = None
 _vlm_dual_style_models: object | None = None
-_vlm_combined_style_model: object | None = None
+_ur_style_model: object | None = None
 
 
 def count_reward_dimensions(reward_type: str) -> int:
@@ -601,7 +614,6 @@ def count_reward_dimensions(reward_type: str) -> int:
         "video_score": 5,
         "video_score2": 3,
         "unifiedreward_think": 3,
-        "vlm_style_dual": 2,
     }
     return _REWARD_DIMENSIONS.get(reward_type, 1)
 
@@ -619,7 +631,7 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
     Returns:
         List of (RewardFunction, display_name) tuples.
     """
-    global _video_score_model, _clip_score_model, _pickscore_model, _video_score2_model, _unifiedreward_think_model, _vlm_dual_style_models, _vlm_combined_style_model
+    global _video_score_model, _clip_score_model, _pickscore_model, _video_score2_model, _unifiedreward_think_model, _vlm_dual_style_models, _ur_style_model
 
     if name == "video_score":
         if _video_score_model is None:
@@ -713,19 +725,32 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
             _vlm_dual_style_models = _VLMDualStyleModels()
         return [(VLMWatercolorReward(_vlm_dual_style_models), "vlm_watercolor")]
 
-    if name == "vlm_style_dual":
-        from ltx_trainer.rl.rewards_vlm_style import (
-            VLMCombinedRealisticReward,
-            VLMCombinedWatercolorReward,
-            _VLMCombinedStyleModel,
-        )
+    if name == "vlm_pixar":
+        from ltx_trainer.rl.rewards_vlm_style import VLMPixarReward, _VLMStyleModels
 
-        if _vlm_combined_style_model is None:
-            _vlm_combined_style_model = _VLMCombinedStyleModel()
-        return [
-            (VLMCombinedRealisticReward(_vlm_combined_style_model), "vlm_realistic"),
-            (VLMCombinedWatercolorReward(_vlm_combined_style_model), "vlm_watercolor"),
-        ]
+        if _vlm_dual_style_models is None:
+            _vlm_dual_style_models = _VLMStyleModels()
+        return [(VLMPixarReward(_vlm_dual_style_models), "vlm_pixar")]
+
+    if name in ("ur_realistic", "ur_watercolor", "ur_pixar"):
+        from ltx_trainer.rl.rewards_ur_style import URPixarReward, URRealisticReward, URWatercolorReward, _URStyleModel
+
+        if _ur_style_model is None:
+            if _unifiedreward_think_model is not None:
+                # Share model/processor from already-loaded UnifiedReward-Think
+                _ur_style_model = _URStyleModel(
+                    model=_unifiedreward_think_model._model,
+                    processor=_unifiedreward_think_model._processor,
+                )
+            else:
+                _ur_style_model = _URStyleModel()
+        _ur_reward_map = {
+            "ur_realistic": (URRealisticReward, "ur_realistic"),
+            "ur_watercolor": (URWatercolorReward, "ur_watercolor"),
+            "ur_pixar": (URPixarReward, "ur_pixar"),
+        }
+        cls, display_name = _ur_reward_map[name]
+        return [(cls(_ur_style_model), display_name)]
 
     reward_classes: dict[str, type[RewardFunction]] = {
         "redness": RednessReward,
@@ -745,7 +770,8 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
             "sketch", "sketch_plus_clip", "realistic_clip", "realistic_plus_clip",
             "sketch_plus_pickscore", "realistic_plus_pickscore",
             "pickscore", "realistic_pickscore",
-            "vlm_realistic", "vlm_watercolor", "vlm_style_dual",
+            "vlm_realistic", "vlm_watercolor", "vlm_pixar",
+            "ur_realistic", "ur_watercolor", "ur_pixar",
         ]
         raise ValueError(f"Unknown reward function: {name}. Available: {available}")
 

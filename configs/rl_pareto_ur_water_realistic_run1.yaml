@@ -43,8 +43,8 @@ optimization:
   optimizer_type: adamw
   scheduler_params: {}
   scheduler_type: constant
-  steps: 10
-output_dir: outputs/rl_pareto_vlm_combined_run1
+  steps: 5000
+output_dir: outputs/rl_pareto_ur_water_realistic_run1
 rl:
   adv_clip_max: 5.0
   checkpoint_save_interval: 100
@@ -68,11 +68,13 @@ rl:
   precomputed_embeddings_dir: embeddings/rl_1000
   preference_mode: pareto
   prompts_file: packages/ltx-trainer/data/rl_prompts_1000.txt
-  resume_from_checkpoint: null
+  resume_from_checkpoint: outputs/rl_nft_1k_clip_run1/checkpoints/rl_training_state_step_01500.pt
   rewards:
-  - type: vlm_realistic
+  - name: realistic
+    type: ur_realistic
     weight: 1.0
-  - type: vlm_watercolor
+  - name: watercolor
+    type: ur_watercolor
     weight: 1.0
   validation_grid_interval: 100
   validation_prompts_file: packages/ltx-trainer/data/rl_validation_prompts.txt
@@ -116,6 +118,11 @@ wandb:
   - rl
   - nft
   - pareto
-  - vlm-style-dual
-  - combined
-  - smoketest
+  - ur-realistic
+  - ur-watercolor
+  - 1k-prompts
+  - 121f
+  - lr3e-5
+  - kl0.1
+  - rank64
+  - multipref2
