@@ -646,6 +646,11 @@ class RLConfig(ConfigBaseModel):
         description="Generate a validation grid video every N optimizer steps. None to disable.",
     )
 
+    training_samples_interval: int | None = Field(
+        default=None,
+        description="Save training sample videos + reward grid every N epochs. None to disable.",
+    )
+
     resume_from_checkpoint: str | Path | None = Field(
         default=None,
         description="Path to training state .pt file or checkpoint directory to resume from. "

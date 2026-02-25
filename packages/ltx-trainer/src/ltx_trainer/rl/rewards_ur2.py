@@ -1,11 +1,19 @@
-"""UnifiedReward-based style reward functions using logits scoring (no CoT).
+"""UnifiedReward-2.0 style reward functions using logits scoring.
 
-Same logits-extraction approach as rewards_vlm_style.py (softmax over digit
-tokens 0-5, weighted sum → [0,1]) but using the UnifiedReward-Think model
-(CodeGoat24/UnifiedReward-Think-qwen3vl-8b) which is a stronger reward model.
+Uses CodeGoat24/UnifiedReward-2.0-qwen-7b (Qwen2.5-VL based, 7B params) for
+style scoring via logits extraction over digit tokens 0-5.
 
-Can share the already-loaded model/processor from _UnifiedRewardThinkModel
-(rewards_unifiedreward.py) to avoid loading the same 8B model twice on GPU.
+Compared to rewards_ur_style.py (Qwen3-VL based):
+- Different model architecture (Qwen2.5-VL vs Qwen3-VL)
+- No Conv3d performance patch needed
+- Uses qwen_vl_utils.process_vision_info for image preprocessing
+- Supports 4 style dimensions: realistic, watercolor, pixar, bw
+
+Performance (from ablations):
+- 8 frames @ 960x544: ~1.3s per score
+- 16 frames: ~2.6s per score
+- Bottleneck: transformer forward pass (90% of time)
+- Logits extraction = same speed as generation but gives continuous scores
 """
 
 import logging
@@ -15,55 +23,15 @@ import torch
 from PIL import Image
 from torch import Tensor
 
-from torch.nn import functional as F
-
 from ltx_trainer.rl.rewards import RewardFunction, _video_content_hash
 
 logger = logging.getLogger(__name__)
 
+NUM_FRAMES = 8  # Sweet spot: 1.3s/score with good discrimination (vs 2.6s for 16)
 
-def _patch_conv3d_as_linear(model: object) -> None:
-    """Monkey-patch Qwen3-VL's Conv3d patch embedding to use F.linear.
-
-    Qwen3-VL's vision encoder uses Conv3d(3, 1152, kernel_size=(2,16,16),
-    stride=(2,16,16)) as patch embedding. The kernel covers the entire spatial
-    extent, making it functionally identical to a Linear(1536, 1152) layer.
-    However, cuDNN's Conv3d has a pathological performance case with large
-    batch + small spatial dims, taking ~13s per call vs ~0.1ms for F.linear.
-
-    This replaces the patch_embed.forward method with a Linear equivalent.
-    """
-    visual = getattr(model, "visual", None)
-    if visual is None:
-        return
-    patch_embed = getattr(visual, "patch_embed", None)
-    if patch_embed is None:
-        return
-    proj = getattr(patch_embed, "proj", None)
-    if proj is None or not isinstance(proj, torch.nn.Conv3d):
-        return
-
-    embed_dim = patch_embed.embed_dim
-    weight = proj.weight  # [out_channels, in_channels, *kernel_size]
-    bias = proj.bias
-    weight_2d = weight.reshape(embed_dim, -1)  # [1152, 1536]
-
-    orig_forward = patch_embed.forward
-
-    def _fast_forward(hidden_states: Tensor) -> Tensor:
-        target_dtype = weight.dtype
-        x = hidden_states.to(dtype=target_dtype)  # [N, 1536]
-        return F.linear(x, weight_2d, bias)  # [N, 1152]
-
-    patch_embed.forward = _fast_forward
-    logger.info(
-        "URStyleModel: patched Conv3d patch_embed with F.linear "
-        f"({weight_2d.shape[1]} -> {weight_2d.shape[0]})"
-    )
-
-NUM_FRAMES = 8  # Match UnifiedReward training expectations
-
-# --- Prompt templates (copied from rewards_vlm_style.py for independent tuning) ---
+# --- Prompt templates ---
+# These rubric-style prompts were validated to produce meaningful style
+# discrimination on UR2 (tested on LTX-2 generated videos with 4 distinct styles).
 
 PROMPT_PHOTOREALISM = """You are judging sampled frames from a generated video against a caption.
 Caption: "A photorealistic video of {prompt}."
@@ -154,6 +122,64 @@ Scoring rule:
 
 Response format: output ONLY the single digit 0 1 2 3 4 or 5."""
 
+PROMPT_BW = """You are judging sampled frames from a generated video against a caption.
+Caption: "A black and white film noir video of {prompt}. High contrast monochrome, dramatic chiaroscuro lighting."
+
+Task:
+Output ONE integer score 0 to 5 for BOTH content alignment and demanded black-and-white film noir style.
+Be strict. Do not guess unseen details.
+
+Step 1) Style checks (pass/fail):
+- Frames are monochrome / grayscale (no color).
+- High contrast with deep blacks and bright whites.
+- Dramatic lighting with strong shadows (chiaroscuro).
+- No color saturation, no vibrant hues.
+- Temporal consistency: B&W style is uniform across all frames.
+
+Step 2) Content checks (pass/fail):
+- Main subject(s) in {prompt} present and recognizable.
+- Key attributes and relationships in {prompt} correct (if any).
+
+Scoring rule:
+- 5: All style checks pass AND all content checks pass.
+- 4: Style passes AND content mostly correct.
+- 3: Either style or content has issues but not both.
+- 2: Multiple failures but some intent visible.
+- 1: Very weak match.
+- 0: Totally wrong or unusable frames.
+
+Response format: output ONLY the single digit 0 1 2 3 4 or 5."""
+
+PROMPT_TEXT_QUALITY = """You are judging sampled frames from a generated video against a caption.
+Caption: "{prompt}"
+
+Task:
+Output ONE integer score 0 to 5 based on BOTH text adherence and visual quality.
+Be strict. Do not hallucinate details.
+
+Step 1) Text adherence checks (pass/fail):
+- Main subject(s) described in the caption are clearly present.
+- Key attributes from the caption are correct (count, colors, shapes, sizes).
+- Actions, poses, or relationships described in the caption are depicted correctly.
+- Setting or background matches the caption (if specified).
+
+Step 2) Visual quality checks (pass/fail):
+- Frames are clear and sharp (no excessive blur or noise).
+- Lighting is natural and consistent across frames.
+- No visual artifacts, glitches, or color banding.
+- Temporal consistency: objects maintain shape, size, and identity across frames.
+- No deformed faces, hands, or body parts.
+
+Scoring rule:
+- 5: All text adherence checks pass AND all visual quality checks pass.
+- 4: Text adherence passes AND quality mostly passes (one minor quality issue).
+- 3: Either (A) text adherence passes but quality has clear issues, or (B) quality passes but one text adherence check fails.
+- 2: Multiple text adherence or quality failures, but some intent visible.
+- 1: Very weak match; most requirements unmet.
+- 0: Totally wrong or unusable frames.
+
+Response format: output ONLY the single digit 0 1 2 3 4 or 5."""
+
 
 # --- Shared utilities ---
 
@@ -189,58 +215,43 @@ def _extract_score_from_logits(logits: Tensor, score_token_ids: list[int]) -> fl
     return (weighted_sum / 5.0).item()  # Normalize to [0, 1]
 
 
-# --- UnifiedReward style model ---
+# --- UnifiedReward-2.0 style model ---
 
 
-class _URStyleModel:
-    """UnifiedReward-Think model for style scoring via logits extraction (no CoT).
+class _UR2StyleModel:
+    """UnifiedReward-2.0 model for style scoring via logits extraction.
 
-    Can either load its own model or share model/processor from an existing
-    _UnifiedRewardThinkModel instance to avoid loading the same 8B model twice.
+    Uses CodeGoat24/UnifiedReward-2.0-qwen-7b (Qwen2.5-VL based).
+    Requires qwen_vl_utils for image preprocessing.
     """
 
     _TEMPLATES: dict[str, str] = {
         "realistic": PROMPT_PHOTOREALISM,
         "watercolor": PROMPT_WATERCOLOR,
         "pixar": PROMPT_PIXAR,
+        "bw": PROMPT_BW,
+        "text_quality": PROMPT_TEXT_QUALITY,
     }
 
     def __init__(
         self,
-        model: object | None = None,
-        processor: object | None = None,
-        model_name: str = "CodeGoat24/UnifiedReward-Think-qwen3vl-8b",
+        model_name: str = "CodeGoat24/UnifiedReward-2.0-qwen-7b",
     ) -> None:
-        """Initialize URStyleModel.
+        from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
-        Args:
-            model: Pre-loaded model to share (from _UnifiedRewardThinkModel._model).
-            processor: Pre-loaded processor to share (from _UnifiedRewardThinkModel._processor).
-            model_name: HuggingFace model identifier (used only if model/processor not provided).
-        """
-        if model is not None and processor is not None:
-            logger.info("URStyleModel: sharing model/processor from existing UnifiedReward instance")
-            self._model = model
-            self._processor = processor
-        else:
-            from transformers import AutoModelForVision2Seq, AutoProcessor
-
-            logger.info(f"URStyleModel: loading model: {model_name}")
-            self._processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-            self._processor.tokenizer.padding_side = "left"
-            self._model = (
-                AutoModelForVision2Seq.from_pretrained(
-                    model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
-                )
-                .eval()
-                .to("cuda")
+        logger.info(f"UR2StyleModel: loading model: {model_name}")
+        self._processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        self._processor.tokenizer.padding_side = "left"
+        self._model = (
+            Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
             )
-
-        # Fix cuDNN pathological Conv3d performance in Qwen3-VL vision encoder
-        _patch_conv3d_as_linear(self._model)
+            .eval()
+            .to("cuda")
+        )
 
         self._score_token_ids = self._resolve_score_tokens()
-        logger.info(f"URStyleModel: score token IDs: {self._score_token_ids}")
+        logger.info(f"UR2StyleModel: score token IDs: {self._score_token_ids}")
 
         # Per-video cache (one video at a time, multiple styles)
         self._cache_key: bytes | None = None
@@ -272,18 +283,22 @@ class _URStyleModel:
         Returns:
             Score in [0, 1]
         """
+        from qwen_vl_utils import process_vision_info
+
         frames = _sample_frames(video)
         eval_text = template.format(prompt=prompt)
 
-        # Build chat messages with frames as images (Qwen3-VL API)
+        # Build chat messages with frames as images (Qwen2.5-VL API)
         content: list[dict] = [{"type": "image", "image": f} for f in frames]
         content.append({"type": "text", "text": eval_text})
         messages = [{"role": "user", "content": content}]
 
         text = self._processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(messages)
         inputs = self._processor(
             text=[text],
-            images=frames,
+            images=image_inputs,
+            videos=video_inputs,
             padding=True,
             return_tensors="pt",
         )
@@ -302,7 +317,7 @@ class _URStyleModel:
         Args:
             video: Video tensor [C, F, H, W] in [0, 1] range
             prompt: Text prompt used to generate the video
-            style: Style name ("realistic", "watercolor", "pixar")
+            style: Style name ("realistic", "watercolor", "pixar", "bw")
 
         Returns:
             Score in [0, 1]
@@ -319,31 +334,51 @@ class _URStyleModel:
 # --- Reward classes ---
 
 
-class URRealisticReward(RewardFunction):
-    """UnifiedReward-based photorealistic style reward (logits scoring, no CoT)."""
+class UR2RealisticReward(RewardFunction):
+    """UnifiedReward-2.0 photorealistic style reward (logits scoring)."""
 
-    def __init__(self, style_model: _URStyleModel) -> None:
+    def __init__(self, style_model: _UR2StyleModel) -> None:
         self._style = style_model
 
     def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         return self._style.get_score(video, prompt, "realistic")
 
 
-class URWatercolorReward(RewardFunction):
-    """UnifiedReward-based watercolor style reward (logits scoring, no CoT)."""
+class UR2WatercolorReward(RewardFunction):
+    """UnifiedReward-2.0 watercolor style reward (logits scoring)."""
 
-    def __init__(self, style_model: _URStyleModel) -> None:
+    def __init__(self, style_model: _UR2StyleModel) -> None:
         self._style = style_model
 
     def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         return self._style.get_score(video, prompt, "watercolor")
 
 
-class URPixarReward(RewardFunction):
-    """UnifiedReward-based Pixar animation style reward (logits scoring, no CoT)."""
+class UR2PixarReward(RewardFunction):
+    """UnifiedReward-2.0 Pixar animation style reward (logits scoring)."""
 
-    def __init__(self, style_model: _URStyleModel) -> None:
+    def __init__(self, style_model: _UR2StyleModel) -> None:
         self._style = style_model
 
     def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         return self._style.get_score(video, prompt, "pixar")
+
+
+class UR2BWReward(RewardFunction):
+    """UnifiedReward-2.0 black-and-white film noir style reward (logits scoring)."""
+
+    def __init__(self, style_model: _UR2StyleModel) -> None:
+        self._style = style_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        return self._style.get_score(video, prompt, "bw")
+
+
+class UR2TextQualityReward(RewardFunction):
+    """UnifiedReward-2.0 text adherence + visual quality reward (logits scoring)."""
+
+    def __init__(self, style_model: _UR2StyleModel) -> None:
+        self._style = style_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        return self._style.get_score(video, prompt, "text_quality")
