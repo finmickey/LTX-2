@@ -54,6 +54,7 @@ from .nft_loss import compute_nft_loss, compute_per_objective_nft_loss
 from .preference_sampling import sample_preference_for_prompt, sample_preferences_with_subgroups
 from .rewards import get_reward_functions
 from .stat_tracker import compute_pareto_advantages
+from .training_samples_grid import generate_training_samples_html
 
 IS_MAIN_PROCESS = os.environ.get("LOCAL_RANK", "0") == "0"
 VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
@@ -257,6 +258,16 @@ class RLTrainer:
             total_decode_time = 0.0
             total_reward_time = 0.0
 
+            # Predict whether training samples should be saved this epoch
+            ts_interval = rl_cfg.training_samples_interval
+            save_training_samples = False
+            if ts_interval is not None and ts_interval > 0:
+                steps_this_epoch = num_prompts_per_epoch * samples_per_gpu // grad_accum_steps
+                step_end = global_step + max(steps_this_epoch, 1)
+                save_training_samples = (global_step // ts_interval != step_end // ts_interval)
+            training_sample_videos: dict[str, list[tuple[str, Tensor]]] = {}
+            # Maps prompt_idx -> list of (rank_sample_key, pixel_video) pairs
+
             for p_idx in range(num_prompts_per_epoch):
                 prompt_idx = prompt_cycle_idx % num_prompts
                 prompt_cycle_idx += 1
@@ -355,6 +366,15 @@ class RLTrainer:
                     local_positions.append(positions)
                     local_rewards.append(reward)
                     local_individual_rewards.append(individual)
+
+                    # Keep pixel videos for training samples grid
+                    if save_training_samples:
+                        key = str(p_idx)
+                        if key not in training_sample_videos:
+                            training_sample_videos[key] = []
+                        training_sample_videos[key].append(
+                            (f"rank{rank}_k{k}", pixel_video)
+                        )
                     del pixel_video
                 del decoded_batch
                 del all_latents, all_positions
@@ -934,6 +954,60 @@ class RLTrainer:
                     f"adv={mean_advantage:.3f} | "
                     f"{epoch_time:.1f}s (gen={gen_time:.1f} rew={rew_time:.1f} train={train_time:.1f})"
                 )
+
+            # ============================================================
+            # Phase 6: TRAINING SAMPLES GRID (if interval crossed this epoch)
+            # ============================================================
+            if save_training_samples and IS_MAIN_PROCESS and training_sample_videos:
+                ts_step = global_step
+                samples_dir = Path(cfg.output_dir) / "training_samples" / f"step_{ts_step:05d}"
+                samples_dir.mkdir(parents=True, exist_ok=True)
+
+                prompt_sections = []
+                for p_idx_str, vid_list in training_sample_videos.items():
+                    p_idx_int = int(p_idx_str)
+                    ps = epoch_samples[p_idx_int]
+                    gi = all_gathered_individual[p_idx_int]
+
+                    # Save videos and build sample entries
+                    sample_entries = []
+                    for (vid_key, pixel_vid), local_k in zip(vid_list, range(len(vid_list))):
+                        fname = f"prompt_{p_idx_int}_{vid_key}.mp4"
+                        save_video(
+                            video_tensor=pixel_vid,
+                            output_path=samples_dir / fname,
+                            fps=rl_cfg.frame_rate,
+                        )
+                        # Get individual rewards for this sample (local index)
+                        indiv = ps["individual_rewards"][local_k]
+                        total = ps["rewards"][local_k]
+                        sample_entries.append({
+                            "filename": fname,
+                            "individual_rewards": indiv,
+                            "total_reward": total,
+                            "preference": None,
+                        })
+
+                    # Sort by total reward descending
+                    sample_entries.sort(key=lambda s: s["total_reward"], reverse=True)
+
+                    prompt_sections.append({
+                        "prompt_text": ps["prompt_text"],
+                        "samples": sample_entries,
+                        "reward_names": self._reward_names,
+                        "has_preferences": preference_mode == "pareto",
+                    })
+
+                html = generate_training_samples_html(
+                    epoch=epoch,
+                    global_step=ts_step,
+                    prompt_sections=prompt_sections,
+                )
+                (samples_dir / "grid.html").write_text(html)
+                logger.info(f"Training samples grid saved: {samples_dir / 'grid.html'}")
+
+            # Free training sample videos
+            training_sample_videos.clear()
 
             # Check eval/checkpoint for steps from the flush path
             if remaining > 0 and global_step <= num_steps:

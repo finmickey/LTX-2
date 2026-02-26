@@ -180,6 +180,113 @@ Scoring rule:
 
 Response format: output ONLY the single digit 0 1 2 3 4 or 5."""
 
+PROMPT_VISUAL_QUALITY = """You are judging sampled frames from a generated video for visual quality and motion coherence.
+Ignore whether the video matches any particular text description — focus ONLY on visual quality.
+
+Task:
+Output ONE integer score 0 to 5 based on visual quality and temporal coherence.
+Be strict. Do not guess unseen details.
+
+Step 1) Sharpness and clarity (pass/fail):
+- Frames are clear, sharp, and well-resolved (no excessive blur or noise).
+- Fine details (textures, edges) are crisp and readable.
+
+Step 2) Color and lighting (pass/fail):
+- Colors look natural and well-balanced (no oversaturation, banding, or washed-out areas).
+- Lighting is consistent across frames (no sudden brightness jumps).
+
+Step 3) Artifacts and deformities (pass/fail):
+- No visual glitches, tearing, or compression artifacts.
+- No deformed faces, hands, body parts, or melted/distorted objects.
+
+Step 4) Motion and temporal coherence (pass/fail):
+- Objects maintain their shape, size, and identity across frames.
+- Motion is smooth and natural (no jitter, teleportation, or strobing).
+- Background remains stable (no warping or swimming).
+
+Scoring rule:
+- 5: All checks pass; video looks polished and professional.
+- 4: All checks mostly pass; one minor issue (slight blur, tiny artifact).
+- 3: One check clearly fails, but others pass.
+- 2: Multiple checks fail, but video is still watchable.
+- 1: Severe quality issues; most checks fail.
+- 0: Unusable or completely broken frames.
+
+Response format: output ONLY the single digit 0 1 2 3 4 or 5."""
+
+PROMPT_ALIGNMENT = """You are judging sampled frames from a generated video against a caption.
+Caption: "{prompt}"
+
+Task:
+Output ONE integer score 0 to 5 for how well the video content matches the caption.
+Focus ONLY on content alignment — ignore visual quality, style, or motion.
+Be strict. Do not hallucinate details.
+
+Checks (pass/fail):
+- Are the main subjects/objects described in the caption clearly present and recognizable?
+- Are attributes correct (counts, colors, sizes, shapes, positions)?
+- Are actions, poses, or relationships from the caption depicted?
+- Is the setting or background correct (if specified in the caption)?
+
+Scoring rule:
+- 5: All subjects, attributes, actions, and setting match the caption perfectly.
+- 4: All subjects present; one minor attribute or detail is slightly off.
+- 3: Main subjects present but one clear mismatch (wrong count, missing action, wrong setting).
+- 2: Some subjects present but multiple mismatches with the caption.
+- 1: Very weak match; most caption elements are missing or wrong.
+- 0: Video content is completely unrelated to the caption.
+
+Response format: output ONLY the single digit 0 1 2 3 4 or 5."""
+
+PROMPT_PHYSICS = """You are judging sampled frames from a generated video for motion and physical plausibility.
+Ignore whether the video matches any text description — focus ONLY on motion and physics.
+
+Task:
+Output ONE integer score 0 to 5 based on motion quality and physical plausibility.
+Be strict. Do not guess unseen details.
+
+Checks (pass/fail):
+- Is there meaningful subject motion (not just camera zoom/pan on a still image)?
+- Do objects move in physically plausible ways (gravity, momentum, inertia)?
+- Are movements smooth and natural (no jitter, teleportation, or strobing)?
+- Do interactions between objects make physical sense (collisions, support, containment)?
+- Do objects maintain their shape and identity across frames (no morphing or melting)?
+
+Scoring rule:
+- 5: Clear, meaningful motion; all movements are physically plausible and smooth.
+- 4: Good motion with one minor physics issue (slight jitter, small inconsistency).
+- 3: Motion present but one clear physics violation or noticeable jitter/teleportation.
+- 2: Minimal or unnatural motion; multiple physics violations.
+- 1: Essentially a still image with only camera drift, or severe motion artifacts.
+- 0: No motion at all, or completely broken/incoherent movement.
+
+Response format: output ONLY the single digit 0 1 2 3 4 or 5."""
+
+PROMPT_AESTHETICS = """You are judging sampled frames from a generated video for visual aesthetics.
+Ignore whether the video matches any text description — focus ONLY on visual appeal.
+
+Task:
+Output ONE integer score 0 to 5 based on visual aesthetics and technical quality.
+Be strict. Do not guess unseen details.
+
+Checks (pass/fail):
+- Are frames sharp, clear, and well-resolved (no excessive blur or noise)?
+- Is lighting natural and consistent across frames?
+- Are colors well-balanced (no oversaturation, banding, or washed-out areas)?
+- Is the composition visually appealing (good framing, depth, visual balance)?
+- No deformed faces, hands, or body parts?
+- No visual artifacts, glitches, or tearing?
+
+Scoring rule:
+- 5: All checks pass; frames look polished, crisp, and visually appealing.
+- 4: All checks mostly pass; one minor issue (slight blur, tiny artifact).
+- 3: One check clearly fails, but others pass (e.g., good composition but noticeable artifacts).
+- 2: Multiple quality issues but video is still watchable.
+- 1: Severe quality issues; most checks fail.
+- 0: Unusable or completely broken frames.
+
+Response format: output ONLY the single digit 0 1 2 3 4 or 5."""
+
 
 # --- Shared utilities ---
 
@@ -231,6 +338,10 @@ class _UR2StyleModel:
         "pixar": PROMPT_PIXAR,
         "bw": PROMPT_BW,
         "text_quality": PROMPT_TEXT_QUALITY,
+        "visual_quality": PROMPT_VISUAL_QUALITY,
+        "alignment": PROMPT_ALIGNMENT,
+        "physics": PROMPT_PHYSICS,
+        "aesthetics": PROMPT_AESTHETICS,
     }
 
     def __init__(
@@ -382,3 +493,58 @@ class UR2TextQualityReward(RewardFunction):
 
     def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
         return self._style.get_score(video, prompt, "text_quality")
+
+
+class UR2VisualQualityReward(RewardFunction):
+    """UnifiedReward-2.0 visual quality + motion coherence reward (logits scoring).
+
+    Focuses purely on visual quality — does NOT penalize content mismatch.
+    """
+
+    def __init__(self, style_model: _UR2StyleModel) -> None:
+        self._style = style_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        return self._style.get_score(video, prompt, "visual_quality")
+
+
+class UR2AlignmentReward(RewardFunction):
+    """UnifiedReward-2.0 text-video alignment reward (logits scoring).
+
+    Scores how well the video content matches the caption (subjects, attributes,
+    actions, setting). Does NOT judge visual quality or motion.
+    """
+
+    def __init__(self, style_model: _UR2StyleModel) -> None:
+        self._style = style_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        return self._style.get_score(video, prompt, "alignment")
+
+
+class UR2PhysicsReward(RewardFunction):
+    """UnifiedReward-2.0 motion and physics plausibility reward (logits scoring).
+
+    Scores meaningful subject motion, physical plausibility, smoothness.
+    Penalizes still images, camera-only motion, jitter, and teleportation.
+    """
+
+    def __init__(self, style_model: _UR2StyleModel) -> None:
+        self._style = style_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        return self._style.get_score(video, prompt, "physics")
+
+
+class UR2AestheticsReward(RewardFunction):
+    """UnifiedReward-2.0 visual aesthetics reward (logits scoring).
+
+    Scores sharpness, lighting, color balance, composition, and absence of
+    artifacts/deformities. Does NOT judge content alignment or motion.
+    """
+
+    def __init__(self, style_model: _UR2StyleModel) -> None:
+        self._style = style_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        return self._style.get_score(video, prompt, "aesthetics")

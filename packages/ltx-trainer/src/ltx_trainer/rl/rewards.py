@@ -592,6 +592,38 @@ class PickScoreReward(RewardFunction):
         return self._pickscore_model.compute_raw_score(video, prompt)
 
 
+class UR2QualityPlusPickScoreReward(RewardFunction):
+    """Sum of UR2 visual quality [0,1] and PickScore first-frame alignment ~[0,1]."""
+
+    def __init__(self, ur2_model: object, pickscore_model: _PickScoreModel) -> None:
+        self._ur2_model = ur2_model
+        self._pickscore_model = pickscore_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        ur2_score = self._ur2_model.get_score(video, prompt, "visual_quality")
+        pick_score = self._pickscore_model.compute_raw_score(video, prompt)
+        return ur2_score + pick_score
+
+
+class UR2APAPlusClipReward(RewardFunction):
+    """Sum of UR2 Alignment + Physics + Aesthetics scores [0,1] each, plus raw CLIP cosine similarity.
+
+    "APA" = Alignment + Physics + Aesthetics — the 3 default dimensions from the UR2 repo.
+    Total reward ~ [0, 3.4] (three UR2 scores in [0,1] + CLIP ~[0.15, 0.40]).
+    """
+
+    def __init__(self, ur2_model: object, clip_model: _ClipScoreModel) -> None:
+        self._ur2_model = ur2_model
+        self._clip_model = clip_model
+
+    def compute(self, video: Tensor, prompt: str = "", **kwargs: object) -> float:
+        alignment = self._ur2_model.get_score(video, prompt, "alignment")
+        physics = self._ur2_model.get_score(video, prompt, "physics")
+        aesthetics = self._ur2_model.get_score(video, prompt, "aesthetics")
+        clip_raw = self._clip_model.compute_raw_similarity(video, prompt)
+        return alignment + physics + aesthetics + clip_raw
+
+
 class RealisticPickScoreReward(RewardFunction):
     """PickScore with a photorealistic prompt prefix.
 
@@ -628,6 +660,7 @@ _video_score2_model: object | None = None
 _unifiedreward_think_model: object | None = None
 _vlm_dual_style_models: object | None = None
 _ur_style_model: object | None = None
+_ur2_style_model: object | None = None
 
 
 def count_reward_dimensions(reward_type: str) -> int:
@@ -657,7 +690,7 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
     Returns:
         List of (RewardFunction, display_name) tuples.
     """
-    global _video_score_model, _clip_score_model, _pickscore_model, _video_score2_model, _unifiedreward_think_model, _vlm_dual_style_models, _ur_style_model
+    global _video_score_model, _clip_score_model, _pickscore_model, _video_score2_model, _unifiedreward_think_model, _vlm_dual_style_models, _ur_style_model, _ur2_style_model
 
     if name == "video_score":
         if _video_score_model is None:
@@ -798,6 +831,53 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
         cls, display_name = _ur_clip_map[name]
         return [(cls(_ur_style_model, _clip_score_model), display_name)]
 
+    _ur2_single_styles = {
+        "ur2_realistic", "ur2_watercolor", "ur2_pixar", "ur2_bw",
+        "ur2_text_quality", "ur2_visual_quality",
+        "ur2_alignment", "ur2_physics", "ur2_aesthetics",
+    }
+    if name in _ur2_single_styles:
+        from ltx_trainer.rl.rewards_ur2 import (
+            UR2AestheticsReward, UR2AlignmentReward, UR2BWReward,
+            UR2PhysicsReward, UR2PixarReward, UR2RealisticReward,
+            UR2TextQualityReward, UR2VisualQualityReward, UR2WatercolorReward,
+            _UR2StyleModel,
+        )
+
+        if _ur2_style_model is None:
+            _ur2_style_model = _UR2StyleModel()
+        _ur2_reward_map: dict[str, tuple[type[RewardFunction], str]] = {
+            "ur2_realistic": (UR2RealisticReward, "ur2_realistic"),
+            "ur2_watercolor": (UR2WatercolorReward, "ur2_watercolor"),
+            "ur2_pixar": (UR2PixarReward, "ur2_pixar"),
+            "ur2_bw": (UR2BWReward, "ur2_bw"),
+            "ur2_text_quality": (UR2TextQualityReward, "ur2_text_quality"),
+            "ur2_visual_quality": (UR2VisualQualityReward, "ur2_visual_quality"),
+            "ur2_alignment": (UR2AlignmentReward, "ur2_alignment"),
+            "ur2_physics": (UR2PhysicsReward, "ur2_physics"),
+            "ur2_aesthetics": (UR2AestheticsReward, "ur2_aesthetics"),
+        }
+        cls, display_name = _ur2_reward_map[name]
+        return [(cls(_ur2_style_model), display_name)]
+
+    if name == "ur2_quality_plus_pickscore":
+        from ltx_trainer.rl.rewards_ur2 import _UR2StyleModel
+
+        if _ur2_style_model is None:
+            _ur2_style_model = _UR2StyleModel()
+        if _pickscore_model is None:
+            _pickscore_model = _PickScoreModel()
+        return [(UR2QualityPlusPickScoreReward(_ur2_style_model, _pickscore_model), "ur2_quality_plus_pickscore")]
+
+    if name == "ur2_apa_plus_clip":
+        from ltx_trainer.rl.rewards_ur2 import _UR2StyleModel
+
+        if _ur2_style_model is None:
+            _ur2_style_model = _UR2StyleModel()
+        if _clip_score_model is None:
+            _clip_score_model = _ClipScoreModel()
+        return [(UR2APAPlusClipReward(_ur2_style_model, _clip_score_model), "ur2_apa_plus_clip")]
+
     reward_classes: dict[str, type[RewardFunction]] = {
         "redness": RednessReward,
         "blueness": BluenessReward,
@@ -819,6 +899,10 @@ def get_reward_functions(name: str) -> list[tuple[RewardFunction, str]]:
             "vlm_realistic", "vlm_watercolor", "vlm_pixar",
             "ur_realistic", "ur_watercolor", "ur_pixar",
             "ur_realistic_plus_clip", "ur_pixar_plus_clip",
+            "ur2_realistic", "ur2_watercolor", "ur2_pixar", "ur2_bw",
+            "ur2_text_quality", "ur2_visual_quality",
+            "ur2_alignment", "ur2_physics", "ur2_aesthetics",
+            "ur2_quality_plus_pickscore", "ur2_apa_plus_clip",
         ]
         raise ValueError(f"Unknown reward function: {name}. Available: {available}")
 

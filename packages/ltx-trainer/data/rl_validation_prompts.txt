@@ -1,8 +1,8 @@
-drone | A drone flying over a mountain landscape at golden hour
-cat | A cat sitting on a windowsill watching birds outside
-waves | Waves crashing against rocky cliffs during a storm
-guitar | A street musician playing guitar in a busy city square
-snow | Snow falling gently over a quiet village at night
-surfer | A surfer riding a large wave in the ocean
-train | A train passing through a tunnel in the mountains
-fireworks | Fireworks exploding over a city skyline at night
+drone | A drone flying slowly over a vast mountain landscape bathed in warm golden hour light.
+cat | A curious cat sitting on a wooden windowsill watching small birds flutter outside the glass.
+waves | A dramatic view of powerful ocean waves crashing against dark rocky cliffs during a storm.
+guitar | A street musician playing an acoustic guitar in a crowded city square on a sunny afternoon.
+snow | A quiet village blanketed in fresh snow with gentle snowflakes falling softly through the night sky.
+surfer | A skilled surfer riding the crest of a large turquoise wave in the open ocean.
+train | A passenger train emerging from a stone tunnel winding through lush green mountain scenery.
+fireworks | A spectacular fireworks display exploding in bright colors over a glittering city skyline at night.

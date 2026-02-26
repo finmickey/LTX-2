@@ -648,7 +648,7 @@ class RLConfig(ConfigBaseModel):
 
     training_samples_interval: int | None = Field(
         default=None,
-        description="Save training sample videos + reward grid every N epochs. None to disable.",
+        description="Save training sample videos + reward grid every N optimizer steps. None to disable.",
     )
 
     resume_from_checkpoint: str | Path | None = Field(
